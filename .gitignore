@@ -1,0 +1,5 @@
+build/
+build_assets/
+*.dmg
+.DS_Store
+__pycache__/
