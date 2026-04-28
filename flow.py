@@ -585,9 +585,12 @@ class AICleanup:
         it_hits = sum(1 for t in toks if t in IT_STOPS)
         en_ratio = en_hits / len(toks)
 
-        if e == "ru" and RU_CYRIL == 0 and len(cleaned) > 10:
+        # If the user explicitly picked Russian or Arabic, the output MUST
+        # contain at least some Cyrillic / Arabic characters — otherwise it's
+        # either an LLM translation or a Whisper script confusion.
+        if e == "ru" and RU_CYRIL == 0 and len(cleaned) >= 4:
             return True
-        if e == "ar" and AR_LET == 0 and len(cleaned) > 10:
+        if e == "ar" and AR_LET == 0 and len(cleaned) >= 4:
             return True
         if e == "it" and en_ratio > 0.18 and en_hits > it_hits:
             return True
@@ -1956,7 +1959,9 @@ class FlowApp(rumps.App):
                 return True
 
         # 3. CJK-script output when target language is NOT CJK → cross-lang
-        # confusion. Common failure mode: Russian/Arabic audio → Chinese chars.
+        # confusion. Common failure mode: Russian/Arabic audio → Chinese
+        # characters. Even 1-2 CJK characters on a short output are diagnostic
+        # when the user has explicitly picked a non-CJK language.
         expected = self._language  # may be None for auto-detect
         if expected and expected not in ("zh", "ja", "ko"):
             cjk = sum(
@@ -1965,7 +1970,14 @@ class FlowApp(rumps.App):
                 or ('぀' <= ch <= 'ヿ')   # Hiragana / Katakana
                 or ('가' <= ch <= '힯')   # Hangul
             )
-            if cjk >= 3 and cjk / max(1, len(compact)) > 0.2:
+            ratio = cjk / max(1, len(compact))
+            # Three trip wires:
+            #   • any CJK in a very short output (≤6 chars) — almost certainly garbage
+            #   • >=2 CJK chars and >=20% of the text is CJK
+            #   • >=3 CJK chars regardless
+            if (cjk >= 1 and len(compact) <= 6) \
+               or (cjk >= 2 and ratio > 0.20) \
+               or (cjk >= 3):
                 return True
 
         # 4. Heavy repetition: same token repeated >5 times consecutively
