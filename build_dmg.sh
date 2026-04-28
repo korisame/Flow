@@ -275,7 +275,24 @@ if [ -f "$DMG_DIR/.payload/python.tar.gz" ] && [ -f "$DMG_DIR/.payload/venv-libs
     fi
     mv "$PORTABLE_PY.tmp/python" "$PORTABLE_PY"
     rm -rf "$PORTABLE_PY.tmp"
-    echo "  ✓ Python at $PORTABLE_PY ($("$PORTABLE_PY/bin/python3" --version 2>&1))"
+
+    # ── Critical: macOS Gatekeeper blocks the freshly-extracted Python and
+    # all bundled .dylib files because they inherit com.apple.quarantine from
+    # the DMG. Strip recursively, then re-apply a fresh ad-hoc signature.
+    echo "→ De-quarantining Python runtime…"
+    xattr -dr com.apple.quarantine "$PORTABLE_PY" 2>/dev/null || true
+    echo "→ Ad-hoc signing Python binaries (this can take ~30 s)…"
+    codesign --force --deep --sign - "$PORTABLE_PY/bin/python3.12" 2>/dev/null || true
+    # Sign every dylib too (Gatekeeper checks each on dlopen)
+    find "$PORTABLE_PY" -name "*.dylib" -o -name "*.so" 2>/dev/null | while read -r f; do
+        codesign --force --sign - "$f" 2>/dev/null
+    done
+
+    echo "  ✓ Python at $PORTABLE_PY"
+    if ! "$PORTABLE_PY/bin/python3" --version 2>&1; then
+        osascript -e 'display alert "Python blocked by macOS" message "The bundled Python could not run. Open Terminal and execute:\n\nxattr -dr com.apple.quarantine ~/.flow/python\ncodesign --force --deep --sign - ~/.flow/python\n\nthen re-run the installer." as critical'
+        exit 7
+    fi
 
     echo "→ Creating venv shell…"
     rm -rf "$VENV_DIR"
@@ -287,6 +304,13 @@ if [ -f "$DMG_DIR/.payload/python.tar.gz" ] && [ -f "$DMG_DIR/.payload/venv-libs
         osascript -e 'display alert "Install failed" message "Could not extract bundled libraries." as critical'
         exit 6
     fi
+
+    echo "→ De-quarantining libraries (.dylib / .so)…"
+    xattr -dr com.apple.quarantine "$VENV_DIR" 2>/dev/null || true
+    echo "→ Ad-hoc signing native extensions (this takes 1–2 min)…"
+    find "$VENV_DIR/lib" \( -name "*.dylib" -o -name "*.so" \) 2>/dev/null | while read -r f; do
+        codesign --force --sign - "$f" 2>/dev/null
+    done
     echo "  ✓ Libraries at $VENV_DIR/lib"
 
     echo "→ Sanity check imports…"
@@ -295,6 +319,7 @@ if [ -f "$DMG_DIR/.payload/python.tar.gz" ] && [ -f "$DMG_DIR/.payload/venv-libs
         echo "  ✓ Setup complete."
     else
         echo "  ⚠ One or more modules failed to import. Check the log above."
+        osascript -e 'display alert "Some modules failed to load" message "See ~/.flow/installer.log for details. Flow may still work but AI cleanup might be unavailable." as warning'
     fi
 else
     echo ""
@@ -335,16 +360,14 @@ launches the app.
 confirm. You only need to do this once.)
 
 
-MANUAL INSTALL  (alternative)
-───────────────
-1. Drag Flow.app to Applications.
-2. Open Terminal and run:
-       xattr -dr com.apple.quarantine /Applications/Flow.app
-3. Launch Flow normally.
+IF THE INSTALLER FAILS  (Gatekeeper crash)
+─────────────────────────────────────────
+Open Terminal and run:
 
-The xattr command is needed because this build is ad-hoc signed (free,
-no Apple Developer ID). macOS Sequoia / Tahoe block such apps unless
-you remove the quarantine attribute manually.
+    xattr -dr com.apple.quarantine ~/.flow ~/Downloads/Flow.dmg
+    sudo xattr -dr com.apple.quarantine /Applications/Flow.app
+
+Then double-click "Install Flow.command" again.
 
 
 REQUIREMENTS

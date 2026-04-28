@@ -44,7 +44,7 @@ import Quartz
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
 APP_NAME   = "Flow"
-VERSION    = "2.0.0"
+VERSION    = "1.0.0"
 KOFI_URL   = "https://ko-fi.com/shaungori"
 
 CONFIG_DIR  = Path.home() / ".flow"
@@ -1272,7 +1272,7 @@ class FlowApp(rumps.App):
         self._login_item.state = self._check_login_item()
 
         # ── Dynamic items ─────────────────────────────────────────────────────
-        self._status_item = rumps.MenuItem("Loading model…")
+        self._status_item = rumps.MenuItem("Loading model…", callback=self._cb_status_clicked)
         self._last_item   = rumps.MenuItem("Last paste — none yet", callback=self._cb_paste_last)
 
         # ── Assemble — native Mac structure: header → shortcuts → settings →
@@ -1467,6 +1467,25 @@ class FlowApp(rumps.App):
         subprocess.run(["osascript", "-e", script], capture_output=True)
         sender.state = not sender.state
 
+    def _cb_status_clicked(self, sender):
+        """
+        Make the status menu item actionable when it surfaces a permission
+        problem. Click → jump straight to the matching System Settings pane.
+        Otherwise it's a no-op (just informational).
+        """
+        title = (sender.title or "").lower()
+        if "accessibility" in title:
+            subprocess.Popen([
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            ])
+        elif "microphone" in title:
+            subprocess.Popen([
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            ])
+        # else: leave it alone (model loading / ready / error are passive)
+
     def _cb_paste_last(self, _):
         if self._history:
             self._paste(self._history[0])
@@ -1560,7 +1579,7 @@ class FlowApp(rumps.App):
         print(f"[tap] CGEventTapCreate returned: {tap!r}", flush=True)
 
         if tap is None:
-            self._set_menu_title(self._status_item, "⚠️  Grant Accessibility permission")
+            self._set_menu_title(self._status_item, "⚠️  Grant Accessibility permission — click to open Settings")
             rumps.notification(
                 "Flow — Action Required",
                 "Accessibility permission needed",
