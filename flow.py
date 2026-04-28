@@ -1862,6 +1862,16 @@ class FlowApp(rumps.App):
                     print(f"[transcribe] hallucination detected — discarding", flush=True)
                     text = ""
 
+                # Anti-repeat tail: Whisper with condition_on_previous_text=True
+                # sometimes duplicates the last sentence on trailing silence.
+                # Strip exact tail repetitions before they reach the user.
+                if text:
+                    stripped = self._strip_trailing_repeat(text)
+                    if stripped != text:
+                        print(f"[transcribe] tail repeat stripped: "
+                              f"{len(text)} → {len(stripped)} chars", flush=True)
+                        text = stripped
+
                 text = self._process_text(text)
                 print(f"[transcribe] processed text: {text!r}", flush=True)
 
@@ -1971,6 +1981,45 @@ class FlowApp(rumps.App):
                     run = 1
 
         return False
+
+    @staticmethod
+    def _strip_trailing_repeat(text: str) -> str:
+        """
+        Whisper occasionally duplicates its last sentence on trailing silence
+        when condition_on_previous_text=True. Strip exact tail repeats:
+          1. Sentence/clause-level: "Foo. Foo." → "Foo."
+          2. Word-level tail n-gram: last K words == previous K words.
+        Iterate until stable so we catch tripled or stacked repeats.
+        """
+        if not text or len(text) < 20:
+            return text
+        prev = None
+        s = text.strip()
+        for _ in range(5):  # max 5 stripping passes is plenty
+            if s == prev:
+                break
+            prev = s
+            # 1. Sentence/clause-level on . ! ?
+            parts = re.split(r"(?<=[.!?])\s+", s)
+            while len(parts) >= 2:
+                a = parts[-2].strip().rstrip(".!?").lower()
+                b = parts[-1].strip().rstrip(".!?").lower()
+                if a and a == b:
+                    parts.pop()
+                else:
+                    break
+            s = " ".join(parts).strip()
+
+            # 2. Word-level tail n-gram (handles repeats without punctuation)
+            words = s.split()
+            n = len(words)
+            for size in range(min(20, n // 2), 2, -1):
+                if words[n - 2 * size : n - size] == words[n - size : n]:
+                    segment = " ".join(words[n - size : n])
+                    if len(segment) >= 12:
+                        s = " ".join(words[: n - size]).strip()
+                        break
+        return s
 
     def _process_text(self, text: str) -> str:
         if not text:
