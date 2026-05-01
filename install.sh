@@ -139,6 +139,7 @@ notify "Installing Flow components (~5 min, one-time)…"
         "faster-whisper" \
         "mlx-whisper" \
         "mlx-lm" \
+        "silero-vad" \
         "sounddevice" \
         "numpy" \
         "rumps" \

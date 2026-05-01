@@ -65,7 +65,7 @@ MIN_UTT_SEC      = 0.4         # min utterance length worth transcribing
 # ─── LANGUAGE / MODEL CONFIG ──────────────────────────────────────────────────
 
 LANGUAGES = {
-    "🌐  Auto-detect": None,
+    "🌐  Auto / Multilingual": None,    # per-chunk auto-detect → handles code-switching
     "🇬🇧  English":    "en",
     "🇮🇹  Italiano":   "it",
     "🇫🇷  Français":   "fr",
@@ -552,9 +552,9 @@ class AICleanup:
     @staticmethod
     def _looks_translated(original: str, cleaned: str, expected_lang: str | None) -> bool:
         """
-        Quick heuristic: if the LLM ignored 'don't translate' and switched to
-        English when the original was a Latin-script romance language, refuse
-        the cleanup. We test for stop-word ratios.
+        Detect when the LLM ignored the "don't translate" instruction.
+        Skipped entirely in multilingual mode (expected_lang is None) — there
+        the user explicitly opts in to mixed-language output.
         """
         if not cleaned or not expected_lang:
             return False
@@ -1089,6 +1089,11 @@ class FlowApp(rumps.App):
         # Pre-warm the local LLM in the background so the first dictation
         # doesn't have to wait for ~1.8 GB to come down from the HF Hub.
         threading.Thread(target=self._prewarm_local_llm, daemon=True).start()
+        # Pre-warm Silero VAD (3s load) so the first transcribe doesn't pay it.
+        threading.Thread(target=lambda: type(self)._silero_trim(np.zeros(16000, dtype="float32")),
+                         daemon=True).start()
+        # First-run onboarding (only if the marker file doesn't exist yet)
+        threading.Thread(target=self._maybe_run_onboarding, daemon=True).start()
 
     # ══════════════════════════════════════════════════════════════════════════
     # NATIVE STATUS-BAR ICONS  (SF Symbols → TIFF on disk → rumps `icon` path)
@@ -1702,26 +1707,69 @@ class FlowApp(rumps.App):
         if audio.size > int(SAMPLE_RATE * 1.0):
             self._q.put(audio)
 
-    @staticmethod
+    # Lazy-loaded Silero VAD model — much smarter than RMS-based trimming.
+    # Distinguishes real speech from quiet background noise; understands the
+    # difference between mid-sentence breaths and end-of-utterance silence.
+    _silero_model = None
+    _silero_lock  = threading.Lock()
+
+    @classmethod
+    def _silero_trim(cls, audio: np.ndarray) -> np.ndarray | None:
+        """
+        Trim audio to the speech-bearing window using Silero VAD. Returns the
+        trimmed numpy array, or None on any failure (caller falls back to RMS).
+        """
+        try:
+            with cls._silero_lock:
+                if cls._silero_model is None:
+                    from silero_vad import load_silero_vad
+                    cls._silero_model = load_silero_vad()
+            from silero_vad import get_speech_timestamps
+            import torch
+            ts = get_speech_timestamps(
+                torch.from_numpy(audio),
+                cls._silero_model,
+                sampling_rate            = SAMPLE_RATE,
+                min_silence_duration_ms  = 500,   # silence must last >0.5s to count
+                speech_pad_ms            = 400,   # keep 400ms padding around speech
+                return_seconds           = False,
+            )
+            if not ts:
+                return None
+            start = max(0, ts[0]["start"])
+            end   = min(audio.size, ts[-1]["end"])
+            if end - start < int(SAMPLE_RATE * 0.3):
+                return None
+            return audio[start:end]
+        except Exception as e:
+            print(f"[silero] {e}", file=sys.stderr, flush=True)
+            return None
+
+    @classmethod
     def _trim_trailing_silence(
+        cls,
         audio: np.ndarray,
         rms_threshold: float = 0.005,
         win_ms: int = 30,
         keep_pad_ms: int = 400,
     ) -> np.ndarray:
         """
-        Crop trailing silence from `audio` to stop Whisper from hallucinating
-        words past the last real speech. Walks back from the end in 30-ms
-        windows; the cut point is the last window whose RMS exceeds the
-        threshold, plus 250 ms of padding so we don't chop the tail of the
-        last word.
+        Crop silence around the speech window.
+        Primary: Silero VAD (ML-based, robust to background noise).
+        Fallback: RMS-window scan (pure numpy, always works).
         """
         if audio.size == 0:
             return audio
+
+        # Try Silero first (handles head + tail silence, mid-sentence pauses)
+        silero_out = cls._silero_trim(audio)
+        if silero_out is not None:
+            return silero_out
+
+        # ── RMS fallback ────────────────────────────────────────────────────
         win = int(SAMPLE_RATE * win_ms / 1000)
         if win <= 0 or audio.size < win:
             return audio
-        # Iterate from the end backwards
         i = audio.size
         last_speech_end = None
         while i - win >= 0:
@@ -1732,7 +1780,7 @@ class FlowApp(rumps.App):
                 break
             i -= win
         if last_speech_end is None:
-            return audio          # all silent: let caller's size check drop it
+            return audio
         cut = min(audio.size, last_speech_end + int(SAMPLE_RATE * keep_pad_ms / 1000))
         return audio[:cut]
 
@@ -2171,6 +2219,135 @@ class FlowApp(rumps.App):
         finally:
             with self._llm_dl_lock:
                 self._llm_dl_in_flight = False
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FIRST-RUN ONBOARDING
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _maybe_run_onboarding(self):
+        """
+        Three-step welcome the very first time Flow runs. Marker file is
+        ~/.flow/.onboarded — once present, this method exits immediately.
+        Steps: welcome → grant Accessibility → pick language.
+        """
+        marker = CONFIG_DIR / ".onboarded"
+        if marker.exists():
+            return
+        # Wait for the menu bar to be up before showing alerts
+        time.sleep(2)
+
+        try:
+            # ── Step 1 — welcome ──────────────────────────────────────────────
+            self._osa_alert(
+                "Welcome to Flow",
+                "Flow is a local voice-dictation app for macOS.\n\n"
+                "• Hold Fn — push to talk, release to paste\n"
+                "• Press Fn twice — hands-free mode\n\n"
+                "Three quick steps and you're ready.",
+                buttons=["Continue"],
+            )
+
+            # ── Step 2 — Accessibility ────────────────────────────────────────
+            choice = self._osa_alert(
+                "Step 1 of 2 — Grant Accessibility",
+                "Flow needs Accessibility permission to detect the Fn key "
+                "across all apps.\n\n"
+                "Click \"Open Settings\" — find Flow in the list, switch it ON, "
+                "then come back here.",
+                buttons=["Skip", "Open Settings"],
+            )
+            if choice == "Open Settings":
+                subprocess.Popen([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                ])
+                # Give the user time to flip the toggle
+                self._osa_alert(
+                    "Almost there",
+                    "When you've enabled Flow under Privacy & Security → "
+                    "Accessibility, click Done.",
+                    buttons=["Done"],
+                )
+
+            # ── Step 3 — language ─────────────────────────────────────────────
+            languages = list(LANGUAGES.keys())
+            picked = self._osa_choose(
+                title  = "Step 2 of 2 — Pick your language",
+                prompt = "What language will you mostly dictate in?\n"
+                         "(You can change this anytime from the menu.)",
+                items  = languages,
+                default= "🌐  Auto / Multilingual",
+            )
+            if picked and picked in LANGUAGES:
+                self._cfg["language"] = LANGUAGES[picked]
+                save_config(self._cfg)
+                self._language = LANGUAGES[picked]
+                # Update the language menu radio state
+                for label, item in self._lang_items.items():
+                    item.state = (label == picked)
+
+            # ── Done ──────────────────────────────────────────────────────────
+            self._osa_alert(
+                "You're set",
+                "Hold Fn anywhere on your Mac and start talking.\n"
+                "The first dictation downloads the Whisper model (~1.5 GB).",
+                buttons=["Got it"],
+            )
+            marker.touch()
+        except Exception as e:
+            print(f"[onboarding] failed: {e}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _osa_alert(title: str, message: str, buttons: list[str]) -> str:
+        """
+        Wrapper around AppleScript "display alert" — returns the label of the
+        button clicked. Always runs on a worker thread, blocking until the
+        user dismisses.
+        """
+        title_esc   = title.replace('"', '\\"')
+        message_esc = message.replace('"', '\\"').replace("\n", "\\n")
+        btns = ", ".join(f'"{b}"' for b in buttons)
+        script = (
+            f'display alert "{title_esc}" message "{message_esc}" '
+            f'buttons {{{btns}}} default button "{buttons[-1]}"'
+        )
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=600,
+            )
+            # osascript returns "button returned:Done"
+            for line in r.stdout.splitlines():
+                if "button returned:" in line:
+                    return line.split(":", 1)[1].strip()
+        except Exception as e:
+            print(f"[osa] alert failed: {e}", file=sys.stderr, flush=True)
+        return buttons[-1]
+
+    @staticmethod
+    def _osa_choose(title: str, prompt: str, items: list[str],
+                    default: str | None = None) -> str | None:
+        """List picker via AppleScript `choose from list`."""
+        items_q = ", ".join(f'"{i}"' for i in items)
+        default_q = f'"{default}"' if default else "{}"
+        script = (
+            f'choose from list {{{items_q}}} '
+            f'with title "{title}" '
+            f'with prompt "{prompt.replace(chr(10), " ")}" '
+            f'default items {{{default_q}}} '
+            f'OK button name "Continue" cancel button name "Skip"'
+        )
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=600,
+            )
+            out = r.stdout.strip()
+            if out and out != "false":
+                return out
+        except Exception:
+            pass
+        return None
 
     # ══════════════════════════════════════════════════════════════════════════
     # TELEMETRY
