@@ -1283,8 +1283,29 @@ class FlowApp(rumps.App):
         self._status_item = rumps.MenuItem("Loading model…", callback=self._cb_status_clicked)
         self._last_item   = rumps.MenuItem("Last paste — none yet", callback=self._cb_paste_last)
 
-        # ── Assemble — native Mac structure: header → shortcuts → settings →
-        # last paste → toggles → status → about ────────────────────────────
+        # ── Settings submenu — everything that's "set once, forget" goes
+        # here so the top-level menu stays scannable. ──────────────────────
+        settings_menu = rumps.MenuItem("Settings")
+        # Engine
+        settings_menu.add(model_menu)
+        settings_menu.add(backend_menu)
+        settings_menu.add(rumps.separator)
+        # AI cleanup
+        settings_menu.add(ai_menu)
+        settings_menu.add(tone_menu)
+        settings_menu.add(llm_menu)
+        settings_menu.add(rumps.MenuItem(
+            "Edit Dictionary…", callback=self._cb_edit_dictionary,
+        ))
+        settings_menu.add(rumps.separator)
+        # Toggles
+        settings_menu.add(self._snd_item)
+        settings_menu.add(self._fil_item)
+        settings_menu.add(self._cmd_item)
+        settings_menu.add(self._hud_item)
+        settings_menu.add(self._login_item)
+
+        # ── Top-level — minimal, scannable. The bulk lives under Settings. ─
         self.menu = [
             rumps.MenuItem(f"Flow {VERSION}"),
             None,
@@ -1292,21 +1313,10 @@ class FlowApp(rumps.App):
             rumps.MenuItem("Press Fn twice — hands-free"),
             None,
             lang_menu,
-            model_menu,
-            backend_menu,
-            None,
-            ai_menu,
-            tone_menu,
-            llm_menu,
-            rumps.MenuItem("Edit Dictionary…", callback=self._cb_edit_dictionary),
             None,
             self._last_item,
             None,
-            self._snd_item,
-            self._fil_item,
-            self._cmd_item,
-            self._hud_item,
-            self._login_item,
+            settings_menu,
             None,
             self._status_item,
             None,
