@@ -152,13 +152,15 @@ BACKENDS = [
 ]
 
 LOCAL_LLMS = [
-    # (id,            hf-repo,                                          expected_bytes, label)
-    ("qwen2.5-3b",  "mlx-community/Qwen2.5-3B-Instruct-4bit",   1_800_000_000, "Qwen2.5 3B  ·  follows instructions well  (recommended)"),
-    ("qwen2.5-7b",  "mlx-community/Qwen2.5-7B-Instruct-4bit",   4_200_000_000, "Qwen2.5 7B  ·  best quality / disk trade-off"),
-    ("llama-3.2-3b","mlx-community/Llama-3.2-3B-Instruct-4bit", 1_700_000_000, "Llama 3.2 3B  ·  fast but creative"),
-    ("llama-3.1-8b","mlx-community/Llama-3.1-8B-Instruct-4bit", 4_500_000_000, "Llama 3.1 8B  ·  solid"),
+    # (id,             hf-repo,                                            expected_bytes, label)
+    ("llama-3.2-1b",  "mlx-community/Llama-3.2-1B-Instruct-4bit",    700_000_000,  "Llama 3.2 1B  ·  fastest  (~0.2 s)"),
+    ("qwen2.5-1.5b",  "mlx-community/Qwen2.5-1.5B-Instruct-4bit",    900_000_000,  "Qwen2.5 1.5B  ·  fast  (~0.3 s)"),
+    ("qwen2.5-3b",    "mlx-community/Qwen2.5-3B-Instruct-4bit",    1_800_000_000,  "Qwen2.5 3B  ·  balanced  (~0.7 s, recommended)"),
+    ("qwen2.5-7b",    "mlx-community/Qwen2.5-7B-Instruct-4bit",    4_200_000_000,  "Qwen2.5 7B  ·  best quality  (~2 s)"),
+    ("llama-3.2-3b",  "mlx-community/Llama-3.2-3B-Instruct-4bit",  1_700_000_000,  "Llama 3.2 3B  ·  legacy"),
+    ("llama-3.1-8b",  "mlx-community/Llama-3.1-8B-Instruct-4bit",  4_500_000_000,  "Llama 3.1 8B  ·  highest quality  (~3 s)"),
 ]
-DEFAULT_LOCAL_LLM = "qwen2.5-3b"
+DEFAULT_LOCAL_LLM = "qwen2.5-1.5b"
 
 def _local_llm_meta(llm_id: str) -> tuple[str, int, str]:
     """Return (hf-repo, expected_bytes, label) for a given llm id."""
@@ -605,8 +607,18 @@ class AICleanup:
         text = (text or "").strip()
         if not text or not self.is_enabled():
             return text
-        # Don't bother for very short inputs — nothing to clean.
-        if len(text.split()) < 3:
+
+        # Skip cleanup on short utterances — Whisper is already accurate enough
+        # and the LLM round-trip costs more than the marginal quality gain.
+        if len(text.split()) < 6:
+            return text
+
+        # Skip when the text is already well-formed: starts with a capital
+        # letter and ends with a sentence terminator. Most real-world dictation
+        # past 6 words on Whisper turbo already meets this bar, especially
+        # after our regex pre-pass.
+        if (text[0].isupper() and text[-1] in ".!?…")  \
+           and not any(f in text.lower() for f in ("um ", "uh ", "ehm ", "cioè ")):
             return text
 
         tone = self._effective_tone(app_bundle)
