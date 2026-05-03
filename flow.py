@@ -2157,7 +2157,8 @@ class FlowApp(rumps.App):
         r"\bbye[\s!.]*$",
         # Italian
         r"\biscriviti al canale[!.\s]*",
-        r"\bgrazie per (aver guardato|l'attenzione)[!.\s]*",
+        r"\bgrazie per (aver guardato|aver visto|l'?attenzione)[!.\s]*",
+        r"\b(ci vediamo|alla prossima)[!.\s]*$",
         # Spanish
         r"\bsuscríbanse al canal[!.\s]*",
         r"\bgracias por ver[!.\s]*",
@@ -2189,9 +2190,12 @@ class FlowApp(rumps.App):
         # Collapse whitespace, fix orphaned punctuation like " ." or " ,"
         out = re.sub(r"\s+([.!?,:;])", r"\1", out)
         out = re.sub(r"\s{2,}", " ", out).strip()
-        # Trailing connector words now dangling ("... low quality and")
-        out = re.sub(r"\b(and|but|so|also|inoltre|però|y|et|und|и)\s*[.!?]?$",
+        # Strip trailing connector words ("... low quality and") and orphan
+        # commas/conjunctions left behind by phrase removal
+        out = re.sub(r"[,;]\s*$", "", out).strip()
+        out = re.sub(r"\b(and|but|so|also|inoltre|però|e|ed|y|et|und|и)\s*[,.!?]?$",
                      "", out, flags=re.IGNORECASE).strip()
+        out = re.sub(r"[,;]\s*$", "", out).strip()
         # Re-add trailing period if we trimmed it off
         if out and out[-1] not in ".!?…":
             out += "."
