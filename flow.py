@@ -1350,6 +1350,15 @@ class FlowApp(rumps.App):
                 self._language = code
                 self._cfg["language"] = code
                 save_config(self._cfg)
+                # Whisper Turbo is significantly less accurate on Russian /
+                # Arabic compared to Large-v3. Suggest the swap once.
+                if code in ("ru", "ar") and self._model_name == "large-v3-turbo":
+                    rumps.notification(
+                        "Flow",
+                        f"Tip — switch to large-v3 for better {code.upper()}",
+                        "Settings → Whisper Model → large-v3 "
+                        "(slower but ~2× more accurate on this language)",
+                    )
                 break
 
     def _cb_set_model(self, sender):
@@ -2012,16 +2021,47 @@ class FlowApp(rumps.App):
         if len(compact) >= 10 and len(set(compact)) <= 3:
             return True
 
-        # 2. Known Whisper stock hallucinations
+        # 2. Known Whisper stock hallucinations across languages
         STOCK = (
+            # English
             "thanks for watching",
             "thank you for watching",
             "subscribe to",
-            "ご視聴ありがとうございました",
-            "字幕志愿者",
+            "please subscribe",
+            "don't forget to subscribe",
             "amara.org",
+            # Italian
             "iscriviti al canale",
             "grazie per aver guardato",
+            "grazie per l'attenzione",
+            # Russian
+            "подписывайтесь на канал",
+            "спасибо за просмотр",
+            "ставьте лайки",
+            "субтитры",
+            # Croatian/Serbian/Bosnian (Whisper turbo confuses Russian → Slavic)
+            "hvala što pratite kanal",
+            "hvala na gledanju",
+            "pretplatite se",
+            # Arabic
+            "شكرا للمشاهدة",
+            "اشتركوا في القناة",
+            # Spanish (Whisper sometimes drops to Spanish)
+            "gracias por ver",
+            "suscríbete al canal",
+            # French
+            "merci d'avoir regardé",
+            "abonnez-vous",
+            # German
+            "danke fürs zuschauen",
+            "abonniert den kanal",
+            # Japanese
+            "ご視聴ありがとうございました",
+            "チャンネル登録",
+            # Chinese
+            "字幕志愿者",
+            "感谢观看",
+            "请订阅",
         )
         low = s.lower()
         for h in STOCK:
