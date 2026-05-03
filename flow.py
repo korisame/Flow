@@ -1962,16 +1962,25 @@ class FlowApp(rumps.App):
                 t["chars_in"]     = len(text)
                 print(f"[transcribe] raw text: {text!r}  (lang={detected_lang})", flush=True)
 
-                # Anti-hallucination guard: Whisper sometimes emits a single
-                # character repeated dozens of times (e.g. "ギギギ…" on silent
-                # or near-silent audio). Detect and discard.
+                # First pass: strip embedded YouTube-style stock phrases
+                # ("I'll see you next time", "subscribe to my channel", etc.)
+                # that Whisper injects mid-text. We surgically REMOVE only the
+                # phrase, not the whole transcription.
+                if text:
+                    cleaned_phrase = self._strip_stock_phrases(text)
+                    if cleaned_phrase != text:
+                        print(f"[transcribe] stock phrase stripped: "
+                              f"{len(text)} → {len(cleaned_phrase)} chars", flush=True)
+                        text = cleaned_phrase
+
+                # Anti-hallucination guard for cases where the entire output
+                # is garbage (CJK on Russian, single-char repeats, all-stock).
                 if text and self._is_hallucination(text):
                     print(f"[transcribe] hallucination detected — discarding", flush=True)
                     text = ""
 
                 # Anti-repeat tail: Whisper with condition_on_previous_text=True
                 # sometimes duplicates the last sentence on trailing silence.
-                # Strip exact tail repetitions before they reach the user.
                 if text:
                     stripped = self._strip_trailing_repeat(text)
                     if stripped != text:
@@ -2128,6 +2137,65 @@ class FlowApp(rumps.App):
                     run = 1
 
         return False
+
+    # Phrases Whisper hallucinates from YouTube training data, regardless of
+    # what was actually said. Stripped surgically (only the phrase + adjacent
+    # punctuation/whitespace), so legitimate transcription is preserved.
+    _STOCK_PHRASE_PATTERNS = [
+        # English
+        r"\b(and )?i'?ll see you next time[!.\s]*",
+        r"\b(and )?i'?ll see you (in the )?next (one|video|time)[!.\s]*",
+        r"\bsee you (in )?(the )?next (one|video|time)[!.\s]*",
+        r"\bthanks? (so much )?for watching[!.\s]*",
+        r"\bthank you (so much )?for watching[!.\s]*",
+        r"\b(please )?(don'?t forget to )?(subscribe|like and subscribe)[\s!.,]*",
+        r"\b(please )?like and subscribe[!.\s]*",
+        r"\bsubscribe to (my|the) channel[!.\s]*",
+        r"\bhit the bell( icon)?[!.\s]*",
+        r"\bsmash (that|the) like button[!.\s]*",
+        r"\bsee you (guys )?(soon|later|next time)[!.\s]*",
+        r"\bbye[\s!.]*$",
+        # Italian
+        r"\biscriviti al canale[!.\s]*",
+        r"\bgrazie per (aver guardato|l'attenzione)[!.\s]*",
+        # Spanish
+        r"\bsuscríbanse al canal[!.\s]*",
+        r"\bgracias por ver[!.\s]*",
+        # French
+        r"\babonnez-vous[!.\s]*",
+        r"\bmerci d'?avoir regardé[!.\s]*",
+        # German
+        r"\babonniert den kanal[!.\s]*",
+        r"\bdanke fürs zuschauen[!.\s]*",
+        # Russian
+        r"\bподписывайтесь на канал[!.\s]*",
+        r"\bспасибо за просмотр[!.\s]*",
+        r"\bставьте лайки[!.\s]*",
+    ]
+    _STOCK_PHRASE_RES = [re.compile(p, re.IGNORECASE) for p in _STOCK_PHRASE_PATTERNS]
+
+    @classmethod
+    def _strip_stock_phrases(cls, text: str) -> str:
+        """
+        Remove YouTube-style boilerplate that Whisper occasionally injects
+        regardless of audio. Operates surgically — leaves the rest of the
+        transcript intact.
+        """
+        if not text:
+            return text
+        out = text
+        for pat in cls._STOCK_PHRASE_RES:
+            out = pat.sub(" ", out)
+        # Collapse whitespace, fix orphaned punctuation like " ." or " ,"
+        out = re.sub(r"\s+([.!?,:;])", r"\1", out)
+        out = re.sub(r"\s{2,}", " ", out).strip()
+        # Trailing connector words now dangling ("... low quality and")
+        out = re.sub(r"\b(and|but|so|also|inoltre|però|y|et|und|и)\s*[.!?]?$",
+                     "", out, flags=re.IGNORECASE).strip()
+        # Re-add trailing period if we trimmed it off
+        if out and out[-1] not in ".!?…":
+            out += "."
+        return out
 
     @staticmethod
     def _strip_trailing_repeat(text: str) -> str:
