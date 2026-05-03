@@ -222,6 +222,7 @@ DEFAULT_CONFIG = {
     "llm_model":       DEFAULT_LOCAL_LLM,
     "show_hud":        True,
     "user_dictionary": [],              # list of names/terms to bias Whisper toward
+    "hybrid_quality_for_ru_ar": True,   # auto-promote turbo → large-v3 for ru/ar
 }
 
 
@@ -1288,6 +1289,12 @@ class FlowApp(rumps.App):
         self._hud_item  = rumps.MenuItem("Show HUD overlay",     callback=self._cb_toggle_hud)
         self._hud_item.state = self._cfg.get("show_hud", True)
 
+        self._hybrid_item = rumps.MenuItem(
+            "Hi-quality for RU/AR  (use large-v3)",
+            callback=self._cb_toggle_hybrid,
+        )
+        self._hybrid_item.state = self._cfg.get("hybrid_quality_for_ru_ar", True)
+
         self._login_item = rumps.MenuItem("Launch at Login",     callback=self._cb_toggle_login)
         self._login_item.state = self._check_login_item()
 
@@ -1315,6 +1322,7 @@ class FlowApp(rumps.App):
         settings_menu.add(self._fil_item)
         settings_menu.add(self._cmd_item)
         settings_menu.add(self._hud_item)
+        settings_menu.add(self._hybrid_item)
         settings_menu.add(self._login_item)
 
         # ── Top-level — minimal, scannable. The bulk lives under Settings. ─
@@ -1415,6 +1423,11 @@ class FlowApp(rumps.App):
         save_config(self._cfg)
         if not sender.state:
             self._hud.hide()
+
+    def _cb_toggle_hybrid(self, sender):
+        sender.state                                  = not sender.state
+        self._cfg["hybrid_quality_for_ru_ar"]         = bool(sender.state)
+        save_config(self._cfg)
 
     def _cb_set_ai_backend(self, sender):
         name = sender._flow_ai_backend
@@ -1893,9 +1906,21 @@ class FlowApp(rumps.App):
                     # don't aggressively drop quiet passages, condition on
                     # previous text for cross-30s-chunk continuity.
                     import mlx_whisper
+                    # Hybrid model selection: Whisper Turbo is significantly
+                    # less accurate than Large-v3 on Russian / Arabic. When
+                    # the user is dictating in those languages, transparently
+                    # promote to large-v3-mlx (it caches after first download,
+                    # so swap cost is just a model-load swap, not a download).
+                    effective_repo = mdl
+                    if (lang in ("ru", "ar")
+                            and self._model_name == "large-v3-turbo"
+                            and self._cfg.get("hybrid_quality_for_ru_ar", True)):
+                        effective_repo = "mlx-community/whisper-large-v3-mlx"
+                        print(f"[transcribe] hybrid mode: lang={lang} → "
+                              f"large-v3 (was turbo)", flush=True)
                     result = mlx_whisper.transcribe(
                         audio,
-                        path_or_hf_repo            = mdl,
+                        path_or_hf_repo            = effective_repo,
                         language                   = lang,
                         initial_prompt             = prompt,
                         # Temperature fallback: try greedy first, escalate if a
