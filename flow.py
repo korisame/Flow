@@ -1988,6 +1988,15 @@ class FlowApp(rumps.App):
                               f"{len(text)} → {len(stripped)} chars", flush=True)
                         text = stripped
 
+                # Anti-echo: trailing sentence that mirrors an earlier one
+                # (Whisper injects a paraphrase of the opening on silence).
+                if text:
+                    no_echo = self._strip_trailing_echo(text)
+                    if no_echo != text:
+                        print(f"[transcribe] tail echo stripped: "
+                              f"{len(text)} → {len(no_echo)} chars", flush=True)
+                        text = no_echo
+
                 text = self._process_text(text)
                 print(f"[transcribe] processed text: {text!r}", flush=True)
 
@@ -2200,6 +2209,35 @@ class FlowApp(rumps.App):
         if out and out[-1] not in ".!?…":
             out += "."
         return out
+
+    @staticmethod
+    def _strip_trailing_echo(text: str) -> str:
+        """
+        Drop the last sentence when it's an echo of something said earlier.
+        Whisper sometimes injects a copy of the opening line at the end on
+        trailing silence — distinct from `_strip_trailing_repeat` which only
+        catches *consecutive* duplicates.
+
+        Heuristic: last sentence is meaningful (≥3 content words) AND it
+        already appears (or is contained in) any earlier sentence.
+        """
+        if not text or len(text) < 30:
+            return text
+        parts = re.split(r"(?<=[.!?])\s+", text.strip())
+        if len(parts) < 2:
+            return text
+        last_norm = re.sub(r"[^\w\s']", "", parts[-1].lower()).strip()
+        last_words = last_norm.split()
+        if len(last_words) < 3:
+            return text
+        for earlier in parts[:-1]:
+            e_norm = re.sub(r"[^\w\s']", "", earlier.lower()).strip()
+            # Match if the earlier sentence starts with (or equals) the last
+            # one — captures cases like "X prompt that you wrote..." echoed
+            # at the end as just "X."
+            if e_norm.startswith(last_norm) or last_norm.startswith(e_norm[:len(last_norm)]) and len(last_norm) >= 12:
+                return " ".join(parts[:-1]).strip()
+        return text
 
     @staticmethod
     def _strip_trailing_repeat(text: str) -> str:
