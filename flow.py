@@ -1337,6 +1337,8 @@ class FlowApp(rumps.App):
             self._last_item,
             None,
             settings_menu,
+            rumps.MenuItem("Stop / Reset",
+                           callback=self._cb_emergency_reset),
             None,
             self._status_item,
             None,
@@ -1358,16 +1360,44 @@ class FlowApp(rumps.App):
                 self._language = code
                 self._cfg["language"] = code
                 save_config(self._cfg)
-                # Whisper Turbo is significantly less accurate on Russian /
-                # Arabic compared to Large-v3. Suggest the swap once.
-                if code in ("ru", "ar") and self._model_name == "large-v3-turbo":
-                    rumps.notification(
-                        "Flow",
-                        f"Tip — switch to large-v3 for better {code.upper()}",
-                        "Settings → Whisper Model → large-v3 "
-                        "(slower but ~2× more accurate on this language)",
-                    )
+                # Hybrid mode auto-promotes ru/ar to large-v3. Trigger a
+                # background download NOW so the first dictation in that
+                # language doesn't freeze waiting for ~3 GB.
+                if (code in ("ru", "ar")
+                        and self._cfg.get("hybrid_quality_for_ru_ar", True)):
+                    threading.Thread(
+                        target=self._prewarm_large_v3,
+                        daemon=True,
+                    ).start()
                 break
+
+    def _prewarm_large_v3(self):
+        """Download whisper-large-v3-mlx in the background so hybrid mode
+        on ru/ar doesn't freeze during the first dictation."""
+        repo  = "mlx-community/whisper-large-v3-mlx"
+        cache = Path.home() / ".cache" / "huggingface" / "hub" / (
+            "models--" + repo.replace("/", "--"))
+        try:
+            existing = subprocess.run(
+                ["du", "-sk", str(cache)],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.split()[0] if cache.exists() else "0"
+            if int(existing) * 1024 >= 2_500_000_000:
+                return
+        except Exception:
+            pass
+        rumps.notification(
+            "Flow", "Downloading Whisper Large-v3 (~3 GB)",
+            "Better accuracy for Russian / Arabic. Pre-loaded so your first "
+            "dictation in that language is fast.",
+        )
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=repo, allow_patterns=["*.json","*.npz","*.txt","*.tiktoken"])
+            rumps.notification("Flow", "Large-v3 ready",
+                               "Russian / Arabic dictation now uses high-quality model.")
+        except Exception as e:
+            print(f"[prewarm-large-v3] {e}", file=sys.stderr, flush=True)
 
     def _cb_set_model(self, sender):
         name = sender._flow_model
@@ -1518,6 +1548,39 @@ class FlowApp(rumps.App):
             )
         subprocess.run(["osascript", "-e", script], capture_output=True)
         sender.state = not sender.state
+
+    def _cb_emergency_reset(self, _):
+        """
+        Force-reset Flow's recording state. Use when the app appears stuck
+        in a "listening forever" state (hands-free won't stop, queue jammed,
+        etc.). Stops the recorder, clears the queue, hides the HUD, and
+        returns the menu to idle.
+        """
+        try:
+            self._recording  = False
+            self._hands_free = False
+            self._fn_down    = False
+            self._stop_timer.set()
+            try:
+                self._recorder.stop()
+            except Exception:
+                pass
+            # Drain any queued audio
+            drained = 0
+            while True:
+                try:
+                    self._q.get_nowait()
+                    drained += 1
+                except Exception:
+                    break
+            self._apply_state(self._STATE_IDLE)
+            self._hud.hide()
+            print(f"[reset] emergency reset — drained {drained} pending audio chunks",
+                  flush=True)
+            rumps.notification("Flow", "Reset complete",
+                               f"Cleared {drained} pending audio chunks. Ready.")
+        except Exception as e:
+            print(f"[reset] failed: {e}", file=sys.stderr, flush=True)
 
     def _cb_status_clicked(self, sender):
         """
