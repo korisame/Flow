@@ -2166,8 +2166,11 @@ class FlowApp(rumps.App):
         r"\bbye[\s!.]*$",
         # Italian
         r"\biscriviti al canale[!.\s]*",
-        r"\bgrazie per (aver guardato|aver visto|l'?attenzione)[!.\s]*",
-        r"\b(ci vediamo|alla prossima)[!.\s]*$",
+        r"\bgrazie per (aver guardato|aver visto|l'?attenzione|tutto)[!.\s]*",
+        r"\b(ci vediamo|alla prossima|alla prossima volta)[!.\s]*$",
+        r"^[\s,.]*grazie[\s,.!]*$",                # standalone "Grazie!"
+        r"[,.\s]\s*grazie[\s.!]*$",                # trailing "..., grazie!"
+        r"\bgrazie a (tutti|voi)[\s.!]*$",
         # Spanish
         r"\bsuscríbanse al canal[!.\s]*",
         r"\bgracias por ver[!.\s]*",
