@@ -44,7 +44,7 @@ import Quartz
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
 APP_NAME   = "Flow"
-VERSION    = "1.0.0"
+VERSION    = "1.1.0"
 KOFI_URL   = "https://ko-fi.com/shaungori"
 
 CONFIG_DIR  = Path.home() / ".flow"
@@ -223,6 +223,12 @@ DEFAULT_CONFIG = {
     "show_hud":        True,
     "user_dictionary": [],              # list of names/terms to bias Whisper toward
     "hybrid_quality_for_ru_ar": True,   # auto-promote turbo → large-v3 for ru/ar
+    # Streaming dictation: during press-and-hold, segment audio at silence
+    # boundaries (Silero VAD ~1.5s pause) and run transcription + AI cleanup
+    # in parallel while the user is still talking. Each completed sentence
+    # is pasted live; on Fn release only the trailing fragment needs to be
+    # processed → near-zero perceived latency on long dictations.
+    "streaming_dictation": True,
 }
 
 
@@ -259,6 +265,13 @@ class Recorder:
 
     def __init__(self):
         self._buf          : list         = []
+        # _session_buf accumulates the ENTIRE recording for the current
+        # session, regardless of VAD-pause flushes. Used by streaming
+        # dictation to do one final batch Whisper pass over the full audio
+        # at Fn release — that pass matches the quality of the old non-
+        # streaming path because Whisper sees long contiguous context
+        # rather than 3s slivers.
+        self._session_buf  : list         = []
         self._lock                        = threading.Lock()
         self._stream                      = None
         self._hands_free                  = False
@@ -273,6 +286,7 @@ class Recorder:
     def start(self, hands_free: bool = False, on_utterance=None):
         with self._lock:
             self._buf           = []
+            self._session_buf   = []
             self._hands_free    = hands_free
             self._on_utterance  = on_utterance
             self._last_speech_t = time.monotonic()
@@ -309,7 +323,7 @@ class Recorder:
         raise last_err
 
     def stop(self) -> np.ndarray:
-        """Stop recording and return all buffered audio."""
+        """Stop recording and return all buffered audio (since last flush)."""
         if self._stream:
             self._stream.stop()
             self._stream.close()
@@ -319,6 +333,17 @@ class Recorder:
             self._buf  = []
         return audio
 
+    def get_session_audio(self) -> np.ndarray:
+        """
+        Return ALL audio recorded since the last start(), regardless of
+        VAD-pause flushes. Snapshot — does not clear the buffer, so it can
+        be called both before and after stop().
+        """
+        with self._lock:
+            if not self._session_buf:
+                return np.array([], dtype="float32")
+            return np.concatenate(self._session_buf).flatten()
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _concat_buf(self) -> np.ndarray:
@@ -327,13 +352,24 @@ class Recorder:
         return np.concatenate(self._buf).flatten()
 
     def _audio_cb(self, data, frames, t, status):
-        chunk = data.copy()
+        # sounddevice delivers `data` shaped (frames, channels). We always
+        # request channels=1, so flatten to 1D up-front. Critical bug fix:
+        # after a VAD flush the overlap buffer is 1D, and concatenating a
+        # 1D array with a 2D chunk raises "different number of dimensions".
+        # That kills the audio callback → recorder stops emitting → the
+        # second utterance is never produced and the app appears stuck.
+        chunk = np.ascontiguousarray(data).reshape(-1).copy()
 
         with self._lock:
             self._buf.append(chunk)
+            # Mirror to the full-session buffer used by streaming-final
+            # batch re-transcription. Cheap (just a list append).
+            self._session_buf.append(chunk)
 
-        # Silence detection only active in hands-free mode
-        if not self._hands_free or self._on_utterance is None:
+        # Silence-based segmentation runs whenever a callback is registered.
+        # Used by both hands-free and press-and-hold streaming dictation, so
+        # transcription/cleanup can happen in parallel with the user speaking.
+        if self._on_utterance is None:
             return
 
         rms = float(np.sqrt(np.mean(chunk ** 2)))
@@ -478,30 +514,55 @@ class AICleanup:
         }
         lang_name = self._lang_name(language)
         return (
-            "You are a voice-dictation cleanup assistant.\n"
+            "You are a voice-dictation cleanup assistant. The input is a raw "
+            "transcription of someone speaking. You polish it for written use.\n"
             f"The input is in {lang_name}. "
             f"You MUST output in {lang_name}. "
-            "ABSOLUTE RULE: never translate. If the input is in Italian, output Italian. "
-            "If the input is in Russian, output Russian. Foreign words quoted inside the "
-            "input stay in their original form — do NOT translate them or use them as a "
+            "ABSOLUTE RULE: never translate. Foreign words quoted inside the input "
+            "stay in their original form — do NOT translate them or use them as a "
             "reason to switch language.\n"
-            "Tasks:\n"
-            "  • Fix punctuation and capitalization.\n"
-            "  • Remove filler words (\"um\", \"uh\", \"like\", \"ehm\", \"cioè\").\n"
+            "\n"
+            "WHAT THE INPUT LOOKS LIKE:\n"
+            "  • The transcription may contain SPURIOUS periods from natural "
+            "breathing pauses, not real sentence ends. STRONG SIGNAL of a "
+            "false period: the text after the period starts with a lowercase "
+            "letter or a connector word (e, ma, però, quindi, cioè, e quindi, "
+            "and, but, so). Replace those periods with a comma and lowercase "
+            "the following letter. If the text after the period starts with "
+            "a capital letter and a new topic, leave it as a period.\n"
+            "  • The transcription may contain duplicated words at fragment "
+            "boundaries (\"cosi cosi ci rivediamo\" → \"così ci rivediamo\"). "
+            "Fuse only obvious duplicates, never remove a legitimate repetition.\n"
+            "  • The transcription may contain filler words: \"um\", \"uh\", "
+            "\"ehm\", \"cioè\" (only when used as filler, not as connector), "
+            "\"insomma\" (when filler), \"tipo\" (when filler), \"ecco\" (when "
+            "filler). Remove them. Keep them when they carry meaning.\n"
+            "\n"
+            "WHAT TO DO:\n"
+            "  • Fix punctuation and capitalization based on MEANING.\n"
+            "  • Remove fillers and pause-induced false periods.\n"
             "  • Fix obvious word errors.\n"
-            "  • Keep the original meaning.\n"
-            "PUNCTUATION RULES (very important):\n"
-            "  • Use periods (.) and commas (,) by default.\n"
-            "  • Use exclamation marks (!) ONLY when the speaker clearly shouted, "
-            "exclaimed, or used emphatic intonation. Plain statements end with a period, "
-            "NOT an exclamation mark.\n"
-            "  • Use question marks (?) only for actual questions.\n"
-            "  • Do NOT use em-dashes (—) or en-dashes (–). Use commas, periods, "
-            "or parentheses instead.\n"
-            "  • Preserve proper-noun capitalization for product names and brands "
-            "(\"Flow\", \"Llama\", \"iPhone\").\n"
-            "Output ONLY the cleaned text. No preamble. No commentary. No quotes. "
-            "No explanations. Just the cleaned sentence(s).\n"
+            "  • Preserve the speaker's exact wording, register, and content.\n"
+            "\n"
+            "STRICTLY DO NOT:\n"
+            "  • Do NOT add words that aren't in the input. Specifically NEVER prepend "
+            "\"Ok\", \"Allora\", \"So\", \"Well\", \"Cioè\" as transitions if the speaker "
+            "didn't say them. NEVER insert connectives like \". Ok,\" between fragments.\n"
+            "  • Do NOT shorten, summarize, or rephrase. Same words, just polished.\n"
+            "  • Do NOT translate. Do NOT change the meaning.\n"
+            "  • Do NOT use em-dashes (—) or en-dashes (–). Use commas, periods, or "
+            "parentheses.\n"
+            "  • Do NOT add markdown, quotation marks around the whole thing, "
+            "explanations, or commentary.\n"
+            "\n"
+            "PUNCTUATION:\n"
+            "  • Periods and commas by default.\n"
+            "  • Exclamation marks ONLY for clearly emphatic content.\n"
+            "  • Question marks only for real questions.\n"
+            "  • Preserve proper-noun capitalization (Flow, Llama, iPhone, Ferrari).\n"
+            "\n"
+            "Output ONLY the cleaned text. No preamble, no quotes around it, no "
+            "explanations. Just the cleaned sentence(s).\n"
             + TONE_LINES.get(tone_id, TONE_LINES["neutral"])
         )
 
@@ -604,23 +665,24 @@ class AICleanup:
     # ── Public entry point ───────────────────────────────────────────────────
 
     def clean(self, text: str, app_bundle: str | None = None,
-              language: str | None = None) -> str:
+              language: str | None = None, force: bool = False) -> str:
         text = (text or "").strip()
         if not text or not self.is_enabled():
             return text
 
-        # Skip cleanup on short utterances — Whisper is already accurate enough
-        # and the LLM round-trip costs more than the marginal quality gain.
-        if len(text.split()) < 6:
-            return text
+        if not force:
+            # Skip cleanup on short utterances — Whisper is already accurate
+            # enough and the LLM round-trip costs more than the marginal gain.
+            if len(text.split()) < 6:
+                return text
 
-        # Skip when the text is already well-formed: starts with a capital
-        # letter and ends with a sentence terminator. Most real-world dictation
-        # past 6 words on Whisper turbo already meets this bar, especially
-        # after our regex pre-pass.
-        if (text[0].isupper() and text[-1] in ".!?…")  \
-           and not any(f in text.lower() for f in ("um ", "uh ", "ehm ", "cioè ")):
-            return text
+            # Skip when the text is already well-formed: starts with a capital
+            # letter and ends with a sentence terminator. Most real-world
+            # dictation past 6 words on Whisper turbo already meets this bar,
+            # especially after our regex pre-pass.
+            if (text[0].isupper() and text[-1] in ".!?…")  \
+               and not any(f in text.lower() for f in ("um ", "uh ", "ehm ", "cioè ")):
+                return text
 
         tone = self._effective_tone(app_bundle)
         sys_prompt = self._system_prompt(tone, language)
@@ -672,6 +734,13 @@ class AICleanup:
              "Allora, oggi vorrei comprare un iPhone, ma non so se prendere il Pro o il Pro Max."),
             ("perfetto fatto benissimo l'app funziona benissimo sono al 90 percento",
              "Perfetto, fatto benissimo. L'app funziona benissimo, sono al 90%."),
+            # Pause-induced false periods + boundary duplications: the AI
+            # must FUSE fragments and judge sentence ends from meaning, not
+            # from the dots Whisper inserts on every breath.
+            ("Allora voglio un'icona dinamica sulla... sulla taskbar che mi fa vedere... ...vedere lo stato di... di avanzamento del mio utilizzo di codex",
+             "Allora, voglio un'icona dinamica sulla taskbar che mi fa vedere lo stato di avanzamento del mio utilizzo di Codex."),
+            ("ciao cuore fantastico benissimo. sono molto contento. che cosi ci rivediamo",
+             "Ciao cuore, fantastico, benissimo. Sono molto contento che così ci rivediamo."),
         ],
         "en": [
             ("um so I was thinking about uh the project we discussed yesterday",
@@ -1079,6 +1148,41 @@ class FlowApp(rumps.App):
         self._fn_down      = False
         self._last_fn      = 0.0
         self._rec_start    = 0.0
+        # Streaming dictation state (set on _start_recording)
+        self._streaming_active    = False
+        self._stream_first_paste  = True
+        # Quality: lock language to first segment's detection (avoids lang
+        # flapping on short fragments, e.g. "ok" detected as German); pass
+        # previous fragment's tail as initial_prompt so Whisper retains
+        # cross-segment context (its main quality lever for long-form audio).
+        self._stream_lang_lock    = None
+        self._stream_prompt_tail  = ""
+        # Rolling cleanup: track exactly what we've typed into the user's
+        # frontmost app so we can backspace + replace at session end.
+        # _stream_pasted_text  → string currently on screen (from our pastes)
+        # _stream_raw_buffer   → list of raw fragment transcriptions; gets
+        #                        joined and AI-cleaned in one go on Fn release.
+        self._stream_pasted_text  = ""
+        self._stream_raw_buffer   = []
+        # Clipboard preservation across a multi-paste session. The original
+        # _paste() saved+restored clipboard EVERY call; with rolling cleanup
+        # we paste many times in quick succession and the per-call restore
+        # raced Cmd+V on slow apps → the previously-saved clipboard would
+        # get pasted into the user's app instead of our text. Now we save
+        # once on the first paste of a burst, and a debounced timer
+        # restores 1s after the LAST paste, long enough for any in-flight
+        # Cmd+V to complete.
+        self._clipboard_saved        = None  # str or None
+        self._clipboard_restore_timer = None
+        self._clipboard_lock          = threading.Lock()
+        # Phase 2 light cleanup: debounced AI cleanup of pasted text
+        # while the user is still dictating, so the live preview gets
+        # progressively polished. The final cleanup at fn release replaces
+        # whatever is on screen at that point. _ai_busy_lock serializes
+        # all AI calls (light + final) since mlx_lm.generate is not
+        # safe to invoke concurrently on the same model.
+        self._light_cleanup_timer = None
+        self._ai_busy_lock        = threading.Lock()
         self._stop_timer   = threading.Event()
 
         # History  (newest first)
@@ -1295,6 +1399,12 @@ class FlowApp(rumps.App):
         )
         self._hybrid_item.state = self._cfg.get("hybrid_quality_for_ru_ar", True)
 
+        self._stream_item = rumps.MenuItem(
+            "Streaming dictation  (paste as you speak)",
+            callback=self._cb_toggle_streaming,
+        )
+        self._stream_item.state = self._cfg.get("streaming_dictation", True)
+
         self._login_item = rumps.MenuItem("Launch at Login",     callback=self._cb_toggle_login)
         self._login_item.state = self._check_login_item()
 
@@ -1323,6 +1433,7 @@ class FlowApp(rumps.App):
         settings_menu.add(self._cmd_item)
         settings_menu.add(self._hud_item)
         settings_menu.add(self._hybrid_item)
+        settings_menu.add(self._stream_item)
         settings_menu.add(self._login_item)
 
         # ── Top-level — minimal, scannable. The bulk lives under Settings. ─
@@ -1459,6 +1570,11 @@ class FlowApp(rumps.App):
         self._cfg["hybrid_quality_for_ru_ar"]         = bool(sender.state)
         save_config(self._cfg)
 
+    def _cb_toggle_streaming(self, sender):
+        sender.state                          = not sender.state
+        self._cfg["streaming_dictation"]      = bool(sender.state)
+        save_config(self._cfg)
+
     def _cb_set_ai_backend(self, sender):
         name = sender._flow_ai_backend
         if name == self._cfg.get("ai_backend"):
@@ -1573,6 +1689,17 @@ class FlowApp(rumps.App):
                     drained += 1
                 except Exception:
                     break
+            # Clear streaming-session state so the next dictation starts fresh.
+            self._streaming_active   = False
+            self._stream_first_paste = True
+            self._stream_lang_lock   = None
+            self._stream_prompt_tail = ""
+            self._stream_pasted_text = ""
+            self._stream_raw_buffer  = []
+            if self._light_cleanup_timer is not None:
+                try: self._light_cleanup_timer.cancel()
+                except Exception: pass
+                self._light_cleanup_timer = None
             self._apply_state(self._STATE_IDLE)
             self._hud.hide()
             print(f"[reset] emergency reset — drained {drained} pending audio chunks",
@@ -1661,36 +1788,65 @@ class FlowApp(rumps.App):
         app = self
         print("[tap] event tap thread starting", flush=True)
 
+        # Hold a reference to the tap so the callback can re-enable it on timeout.
+        tap_ref = [None]
+
+        # CGEventTap disable event types (negative ints emitted by macOS when
+        # the tap is misbehaving). Some pyobjc versions don't expose them, so
+        # fall back to literal values.
+        DISABLED_BY_TIMEOUT    = getattr(Quartz, "kCGEventTapDisabledByTimeout",    0xFFFFFFFE)
+        DISABLED_BY_USER_INPUT = getattr(Quartz, "kCGEventTapDisabledByUserInput",  0xFFFFFFFF)
+
         def _cb(proxy, etype, event, refcon):
             try:
+                # macOS disables our tap when the callback exceeds the
+                # event-processing budget (~1s). Symptom: Fn press is detected
+                # but the release never arrives → Flow thinks the key is held
+                # forever. Re-enable and continue.
+                if etype == DISABLED_BY_TIMEOUT or etype == DISABLED_BY_USER_INPUT:
+                    print(f"[tap] tap disabled (etype={etype}); re-enabling", flush=True)
+                    if tap_ref[0] is not None:
+                        Quartz.CGEventTapEnable(tap_ref[0], True)
+                    # Defensive: clear stuck state so a subsequent press works.
+                    if app._fn_down:
+                        app._fn_down = False
+                        try:
+                            threading.Thread(target=app._on_fn_release, daemon=True).start()
+                        except Exception:
+                            pass
+                    return event
+
                 if etype == Quartz.kCGEventFlagsChanged:
                     flags = Quartz.CGEventGetFlags(event)
                     fn_now = bool(flags & HOTKEY_FLAG)
-                    # DEBUG: log every flagsChanged event so we can see WHAT flag the Fn/Globe sends
-                    print(f"[tap] flagsChanged flags=0x{flags:x} fn={fn_now}", flush=True)
                     if fn_now and not app._fn_down:
                         app._fn_down = True
-                        app._on_fn_press()
+                        # Run the press handler on a worker thread so the
+                        # event-tap callback returns instantly. Anything
+                        # heavier than a few ms inside the cb risks the
+                        # tap being disabled by macOS.
+                        threading.Thread(target=app._on_fn_press, daemon=True).start()
                     elif not fn_now and app._fn_down:
                         app._fn_down = False
-                        app._on_fn_release()
+                        threading.Thread(target=app._on_fn_release, daemon=True).start()
             except Exception as e:
                 print(f"[tap] cb error: {e}", file=sys.stderr, flush=True)
             return event
 
-        # Listen to BOTH flagsChanged AND keyDown so we can see if Fn comes through
-        # as a separate keyDown event (some Macs deliver Globe as keyDown not flagsChanged)
-        mask = (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
-                | Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
-                | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp))
+        # Only flagsChanged needed (Fn is delivered as a flag, not a keycode).
+        # Listening to keyDown/keyUp added load to the cb without benefit.
+        mask = Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
 
+        # ListenOnly = passive observer, no event filtering. Lower latency
+        # and macOS is far less aggressive about disabling listen-only taps.
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
-            Quartz.kCGEventTapOptionDefault,
+            Quartz.kCGEventTapOptionListenOnly,
             mask,
             _cb, None,
         )
+        tap_ref[0] = tap
         print(f"[tap] CGEventTapCreate returned: {tap!r}", flush=True)
 
         if tap is None:
@@ -1768,9 +1924,35 @@ class FlowApp(rumps.App):
         if self._cfg.get("show_hud", True):
             self._hud.show("rec_hf" if self._hands_free else "rec")
 
+        # Streaming dictation: in press-and-hold mode, segment on VAD pauses
+        # so transcription + AI cleanup happen in parallel with the speaker.
+        # Subsequent paste fragments are space-prefixed by the worker.
+        streaming = self._cfg.get("streaming_dictation", True)
+        self._stream_first_paste = True
+        self._streaming_active   = streaming and not self._hands_free
+        # Reset per-session quality state — lang gets locked to whatever the
+        # first segment detects; prompt tail accumulates across fragments
+        # so Whisper has continuity context.
+        self._stream_lang_lock   = None
+        self._stream_prompt_tail = ""
+        # Reset rolling-cleanup state for this dictation session.
+        self._stream_pasted_text = ""
+        self._stream_raw_buffer  = []
+        # Cancel any in-flight light cleanup timer from a stale session.
+        if self._light_cleanup_timer is not None:
+            try:
+                self._light_cleanup_timer.cancel()
+            except Exception:
+                pass
+            self._light_cleanup_timer = None
+
+        on_utt = (self._enqueue_utterance
+                  if (self._hands_free or self._streaming_active)
+                  else None)
+
         self._recorder.start(
             hands_free    = self._hands_free,
-            on_utterance  = (self._enqueue_utterance if self._hands_free else None),
+            on_utterance  = on_utt,
         )
 
         # Live timer thread
@@ -1798,21 +1980,57 @@ class FlowApp(rumps.App):
         self._apply_state(self._STATE_PROC)
         if self._cfg.get("show_hud", True):
             self._hud.show("proc")
-        audio = self._recorder.stop()
-        audio = self._trim_trailing_silence(audio)
 
-        # Enqueue if there's meaningful audio (avoids transcribing accidental taps)
-        if audio.size > int(SAMPLE_RATE * 1.0):
-            self._q.put(audio)
+        was_streaming = getattr(self, "_streaming_active", False)
+        # Snapshot full session audio BEFORE stopping (stop() doesn't clear
+        # the session buffer but it's clearer to read it out here).
+        full_audio = self._recorder.get_session_audio()
+        # Stop the stream + drain trailing buffer.
+        _trailing = self._recorder.stop()
+
+        if was_streaming and self._stream_raw_buffer:
+            # Streaming session: discard the trailing slice and use the FULL
+            # session audio for one batch Whisper pass at fn release. That
+            # gives Whisper the long contiguous context it needs for accurate
+            # transcription, matching the quality of the old non-streaming
+            # path. The intermediate live pastes were just preview — the
+            # final paste comes from this batch transcription.
+            full_audio = self._trim_trailing_silence(full_audio)
+            if full_audio.size > int(SAMPLE_RATE * 0.4):
+                self._q.put((full_audio, True))
+            else:
+                # Fallback: tiny session, paste what we have, no rebatch.
+                self._q.put((np.zeros(0, dtype="float32"), True))
         else:
-            self._apply_state(self._STATE_IDLE)
-            self._hud.hide()
+            # Non-streaming mode: classic single-utterance flow. The trailing
+            # buffer IS the whole utterance, so use it as-is.
+            audio = self._trim_trailing_silence(_trailing)
+            if audio.size > int(SAMPLE_RATE * 1.0):
+                self._q.put((audio, True))
+            else:
+                self._apply_state(self._STATE_IDLE)
+                self._hud.hide()
+
+        # Streaming session is over once we stop the recorder — any audio
+        # enqueued from here on should NOT be space-prefixed unless we
+        # actually streamed something earlier in this session.
+        self._streaming_active = False
 
     def _enqueue_utterance(self, audio: np.ndarray):
-        """Called by Recorder during hands-free pause detection."""
+        """
+        Called by Recorder when a VAD pause is detected mid-recording.
+        In hands-free: each utterance is finalized standalone (paste & cleanup).
+        In streaming press-and-hold: it's an INTERMEDIATE fragment — paste raw,
+        accumulate, defer AI cleanup to Fn release.
+        """
         audio = self._trim_trailing_silence(audio)
-        if audio.size > int(SAMPLE_RATE * 1.0):
-            self._q.put(audio)
+        if audio.size <= int(SAMPLE_RATE * 1.0):
+            return
+        # Streaming press-and-hold → intermediate (raw paste, no cleanup yet)
+        # Hands-free                → final (paste & cleanup each utterance)
+        is_intermediate = (getattr(self, "_streaming_active", False)
+                           and not self._hands_free)
+        self._q.put((audio, not is_intermediate))
 
     # Lazy-loaded Silero VAD model — much smarter than RMS-based trimming.
     # Distinguishes real speech from quiet background noise; understands the
@@ -1920,9 +2138,16 @@ class FlowApp(rumps.App):
 
     def _transcribe_worker_inner(self):
         while True:
-            audio = self._q.get()
+            item = self._q.get()
+            # Backward compat: hands-free path may put bare ndarrays.
+            if isinstance(item, tuple):
+                audio, is_final = item
+            else:
+                audio, is_final = item, True
+
             audio_s = audio.size / SAMPLE_RATE
-            print(f"[transcribe] got audio: {audio.size} samples ({audio_s:.2f}s)", flush=True)
+            print(f"[transcribe] got audio: {audio.size} samples "
+                  f"({audio_s:.2f}s) is_final={is_final}", flush=True)
 
             # Per-utterance timing breakdown — populated as we go and dumped
             # both to console and to ~/.flow/timings.csv at the end.
@@ -1951,6 +2176,15 @@ class FlowApp(rumps.App):
                     continue
 
                 lang   = self._language
+                # Streaming dictation: once the first segment of a session has
+                # been transcribed, lock subsequent segments to the same lang.
+                # Whisper's auto-detect on short fragments (<3s) is unreliable
+                # (saw "Ok non funziona" classified as German). The lock also
+                # applies to the final batch re-transcription even though
+                # _streaming_active is already False at that point.
+                if not lang and self._stream_lang_lock:
+                    lang = self._stream_lang_lock
+
                 prompt = INITIAL_PROMPTS.get(lang, "") if lang else ""
 
                 # User dictionary: append important names/terms so Whisper is
@@ -1960,6 +2194,16 @@ class FlowApp(rumps.App):
                 if user_dict:
                     extra = " ".join(str(w) for w in user_dict if str(w).strip())
                     prompt = (prompt + " " + extra).strip() if prompt else extra
+
+                # Streaming dictation: prepend last fragment's tail so Whisper
+                # has cross-segment context. Without this, every fragment is
+                # transcribed in isolation → bad punctuation, broken sentences,
+                # capitalization mistakes. Whisper's `condition_on_previous_text`
+                # only works WITHIN a single decode; for cross-call continuity
+                # we have to feed it back via initial_prompt.
+                tail = getattr(self, "_stream_prompt_tail", "")
+                if tail:
+                    prompt = (prompt + " " + tail).strip() if prompt else tail
 
                 kind, mdl = model
                 ts_transcribe = time.monotonic()
@@ -2025,6 +2269,15 @@ class FlowApp(rumps.App):
                 t["chars_in"]     = len(text)
                 print(f"[transcribe] raw text: {text!r}  (lang={detected_lang})", flush=True)
 
+                # Streaming dictation: lock language to the first detected one
+                # for the rest of the session. Prevents Whisper from flapping
+                # between e.g. it/de/fr on short fragments.
+                if (getattr(self, "_streaming_active", False)
+                        and detected_lang
+                        and not self._stream_lang_lock):
+                    self._stream_lang_lock = detected_lang
+                    print(f"[stream] language locked to '{detected_lang}'", flush=True)
+
                 # First pass: strip embedded YouTube-style stock phrases
                 # ("I'll see you next time", "subscribe to my channel", etc.)
                 # that Whisper injects mid-text. We surgically REMOVE only the
@@ -2060,8 +2313,117 @@ class FlowApp(rumps.App):
                               f"{len(text)} → {len(no_echo)} chars", flush=True)
                         text = no_echo
 
+                # ── Streaming intermediate fragment ────────────────────────
+                # Decided ONLY by the is_final flag carried with the queue
+                # item — the global _streaming_active flag races with
+                # _stop_recording and is unreliable here. Anything enqueued
+                # with is_final=False MUST have come from the streaming
+                # press-and-hold path, so always treat it as intermediate:
+                # paste raw, accumulate, defer polishing to the final piece.
+                if not is_final:
+                    if text:
+                        # Whisper continuity context for next fragment.
+                        self._stream_prompt_tail = text[-120:]
+                        self._stream_raw_buffer.append(text)
+                        # Live paste, leading space between fragments so words
+                        # don't collide. The final cleanup will re-tokenize anyway.
+                        prefix = "" if self._stream_first_paste else " "
+                        live = prefix + text
+                        ts_paste = time.monotonic()
+                        self._paste(live)
+                        t["paste_s"]   = time.monotonic() - ts_paste
+                        t["chars_out"] = len(live)
+                        self._stream_pasted_text += live
+                        self._stream_first_paste = False
+                        self._add_to_history(live)
+                        print(f"[stream] live raw paste of {len(live)} chars "
+                              f"(buffer: {len(self._stream_raw_buffer)} segs)",
+                              flush=True)
+                        # Phase 2: debounced light cleanup. Resets every paste
+                        # so the cleanup only runs when the user pauses long
+                        # enough to be between sentences (~2s after a fragment).
+                        self._schedule_light_cleanup()
+                    # Defer everything else to the final segment.
+                    continue
+
                 text = self._process_text(text)
                 print(f"[transcribe] processed text: {text!r}", flush=True)
+
+                # Streaming dictation: keep last ~120 chars of cleaned text
+                # as initial_prompt for the next fragment. Whisper uses this
+                # as left-context for decoding, dramatically reducing the
+                # boundary artefacts (capitalization, broken words, spurious
+                # punctuation) that plague isolated short-segment decodes.
+                if getattr(self, "_streaming_active", False) and text:
+                    self._stream_prompt_tail = text[-120:]
+
+                # ── Final segment of a streaming session ───────────────────
+                # `text` here is the FULL session re-transcription (the audio
+                # passed in is the entire recording, not the trailing slice).
+                # That's the high-quality batch pass that Whisper does best:
+                # one long contiguous decode, full context, no boundary
+                # artefacts. We use it as the source of truth and replace
+                # the live-pasted raw text on screen.
+                if is_final and len(self._stream_raw_buffer) > 0:
+                    full_raw = text  # already batch-transcribed + stripped
+                    # Safeguard: if batch transcribe returned empty (e.g.
+                    # very short audio routed via the zero-array fallback,
+                    # or pure silence detection), fall back to the joined
+                    # raw fragments so we never erase the user's preview.
+                    if not full_raw.strip() and self._stream_raw_buffer:
+                        full_raw = " ".join(
+                            s.strip() for s in self._stream_raw_buffer if s
+                        ).strip()
+                        print(f"[stream] batch returned empty, falling back "
+                              f"to {len(self._stream_raw_buffer)} raw segs",
+                              flush=True)
+                    cleaned_full = full_raw
+                    if full_raw and self._ai.is_enabled():
+                        if self._cfg.get("show_hud", True):
+                            self._hud.show("ai")
+                        app_bundle = self._frontmost_app_bundle()
+                        t["ai_used"] = True
+                        ts_cleanup = time.monotonic()
+                        # Cancel any pending light cleanup so it doesn't
+                        # race with the final pass — and acquire the AI
+                        # lock so a light cleanup currently running gets
+                        # to finish before we start the heavy final.
+                        if self._light_cleanup_timer is not None:
+                            try: self._light_cleanup_timer.cancel()
+                            except Exception: pass
+                            self._light_cleanup_timer = None
+                        # force=True bypasses the "looks already clean"
+                        # short-circuit. Concatenated raw fragments tend to
+                        # start capitalized + end with a period, but the
+                        # internals are full of pause-induced false dots
+                        # and boundary glitches that DO need cleanup.
+                        with self._ai_busy_lock:
+                            ai_out = self._ai.clean(
+                                full_raw,
+                                app_bundle = app_bundle,
+                                language   = (self._stream_lang_lock
+                                              or detected_lang),
+                                force      = True,
+                            )
+                        t["cleanup_s"] = time.monotonic() - ts_cleanup
+                        if ai_out and ai_out.strip():
+                            cleaned_full = ai_out
+                            t["ai_kept"] = True
+                            print(f"[stream] AI cleanup over full text "
+                                  f"({len(full_raw)} → {len(cleaned_full)} chars)",
+                                  flush=True)
+                    # Replace what's on screen with cleaned full text.
+                    ts_paste = time.monotonic()
+                    replaced = self._replace_streaming_text(cleaned_full)
+                    t["paste_s"]   = time.monotonic() - ts_paste
+                    t["chars_out"] = len(cleaned_full)
+                    if replaced:
+                        self._add_to_history(cleaned_full)
+                    # Reset session state so a stray subsequent enqueue
+                    # doesn't accidentally revise an unrelated paste.
+                    self._stream_raw_buffer  = []
+                    self._stream_pasted_text = ""
+                    continue
 
                 # AI cleanup pass (LLM): only run if enabled and the result
                 # isn't a special sentinel (e.g. delete-that command).
@@ -2072,11 +2434,12 @@ class FlowApp(rumps.App):
                     app_bundle = self._frontmost_app_bundle()
                     t["ai_used"] = True
                     ts_cleanup = time.monotonic()
-                    cleaned = self._ai.clean(
-                        text,
-                        app_bundle = app_bundle,
-                        language   = detected_lang,
-                    )
+                    with self._ai_busy_lock:
+                        cleaned = self._ai.clean(
+                            text,
+                            app_bundle = app_bundle,
+                            language   = detected_lang,
+                        )
                     t["cleanup_s"] = time.monotonic() - ts_cleanup
                     if cleaned and cleaned != text:
                         print(f"[ai] cleaned ({len(text)} → {len(cleaned)} chars)", flush=True)
@@ -2086,6 +2449,14 @@ class FlowApp(rumps.App):
                 if text == "\x00DEL":
                     self._undo()
                 elif text:
+                    # Streaming dictation: every fragment after the first in a
+                    # recording session needs a leading space so words don't
+                    # collide ("Ciao Tato" + "come stai" → "Ciao Tatocome stai").
+                    if not getattr(self, "_stream_first_paste", True):
+                        if not text.startswith((" ", "\n", "\t")):
+                            text = " " + text
+                    self._stream_first_paste = False
+
                     print(f"[paste] starting paste of {len(text)} chars", flush=True)
                     ts_paste = time.monotonic()
                     self._paste(text)
@@ -2234,6 +2605,27 @@ class FlowApp(rumps.App):
         r"^[\s,.]*grazie[\s,.!]*$",                # standalone "Grazie!"
         r"[,.\s]\s*grazie[\s.!]*$",                # trailing "..., grazie!"
         r"\bgrazie a (tutti|voi)[\s.!]*$",
+        # Italian tutorial / vlog hallucinations. Anchored to end-of-string
+        # ($) so legitimate phrases like "in questo video ti spiego come
+        # funziona X" mid-text are NOT dropped — only standalone tutorial
+        # outros that show up after silence are stripped.
+        r"\bti sto mostrando come fare (il |un )?video[!.\s]*$",
+        r"\bvi sto mostrando come fare (il |un )?video[!.\s]*$",
+        r"\bin questo video (vi|ti) (mostro|spiego|faccio vedere)[!.\s]*$",
+        r"\bspero che (il )?video (vi|ti) sia (piaciuto|stato utile)[!.\s]*$",
+        r"\bmettete (un )?like[!.\s]*$",
+        r"\bcondividete il video[!.\s]*$",
+        # Italian subtitle-credits hallucinations (Whisper trained on
+        # subtitled video corpora, regurgitates these on silence). Always
+        # anchored to end of string.
+        r"\bsottotitoli (e revisione )?a cura di [\w\s]+[!.\s]*$",
+        r"\bsottotitoli (creati|fatti) da [\w\s]+[!.\s]*$",
+        r"\btrascritto da [\w\s]+[!.\s]*$",
+        r"\bsottotitoli e sincronizzazione di [\w\s]+[!.\s]*$",
+        # Audio cue tags Whisper sometimes emits literally:
+        r"\[musica\][!.\s]*",
+        r"\[applausi\][!.\s]*",
+        r"\[risate\][!.\s]*",
         # Spanish
         r"\bsuscríbanse al canal[!.\s]*",
         r"\bgracias por ver[!.\s]*",
@@ -2678,24 +3070,36 @@ class FlowApp(rumps.App):
     # I/O HELPERS
     # ══════════════════════════════════════════════════════════════════════════
 
-    @staticmethod
-    def _paste(text: str):
+    def _paste(self, text: str):
         """
-        Paste text at the cursor of the frontmost app:
-          save clipboard → write text → Cmd+V (via CGEvent) → restore clipboard
-        Uses pbcopy/pbpaste (subprocess, thread-safe) instead of NSPasteboard
-        because AppKit APIs crash when called off the main thread on recent
-        macOS releases ("Must only be used from the main thread").
-        """
-        # Save current clipboard
-        try:
-            old = subprocess.run(
-                ["pbpaste"], capture_output=True, text=True, timeout=1.0
-            ).stdout
-        except Exception:
-            old = ""
+        Paste text at the cursor of the frontmost app.
 
-        # Write our text
+        Clipboard preservation is debounced across multiple pastes. We save
+        the user's clipboard ONCE on the first paste of a burst, then a
+        timer restores it 1s after the LAST paste in the burst. The previous
+        save/restore-on-every-paste pattern raced with Cmd+V on slow apps
+        and would occasionally paste the saved clipboard instead of our
+        text — visible in the wild as "stale message from 10 minutes ago"
+        appearing during dictation.
+        """
+        # Save user's clipboard exactly once per burst.
+        with self._clipboard_lock:
+            if self._clipboard_saved is None:
+                try:
+                    self._clipboard_saved = subprocess.run(
+                        ["pbpaste"], capture_output=True, text=True, timeout=1.0
+                    ).stdout
+                except Exception:
+                    self._clipboard_saved = ""
+            # Cancel any pending restore — we're about to paste again.
+            if self._clipboard_restore_timer is not None:
+                try:
+                    self._clipboard_restore_timer.cancel()
+                except Exception:
+                    pass
+                self._clipboard_restore_timer = None
+
+        # Write our text to clipboard.
         try:
             p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
             p.communicate(text.encode("utf-8"), timeout=2.0)
@@ -2705,7 +3109,7 @@ class FlowApp(rumps.App):
 
         time.sleep(0.06)
 
-        # Cmd+V via Quartz (thread-safe)
+        # Cmd+V via Quartz (thread-safe).
         src  = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
         v_dn = Quartz.CGEventCreateKeyboardEvent(src, 9, True)   # 9 = 'v'
         v_up = Quartz.CGEventCreateKeyboardEvent(src, 9, False)
@@ -2715,13 +3119,28 @@ class FlowApp(rumps.App):
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, v_dn)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, v_up)
 
-        time.sleep(0.18)
+        # Slightly longer than before — gives slow targets headroom before
+        # the next operation runs.
+        time.sleep(0.25)
 
-        # Restore previous clipboard
-        if old:
+        # Schedule clipboard restore (debounced — resets each call).
+        with self._clipboard_lock:
+            self._clipboard_restore_timer = threading.Timer(
+                1.0, self._restore_clipboard
+            )
+            self._clipboard_restore_timer.daemon = True
+            self._clipboard_restore_timer.start()
+
+    def _restore_clipboard(self):
+        """Run on a background timer 1s after the last paste of a burst."""
+        with self._clipboard_lock:
+            saved = self._clipboard_saved
+            self._clipboard_saved        = None
+            self._clipboard_restore_timer = None
+        if saved:
             try:
                 p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-                p.communicate(old.encode("utf-8"), timeout=2.0)
+                p.communicate(saved.encode("utf-8"), timeout=2.0)
             except Exception:
                 pass
 
@@ -2736,6 +3155,158 @@ class FlowApp(rumps.App):
         Quartz.CGEventSetFlags(z_up, cmd)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, z_dn)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, z_up)
+
+    @staticmethod
+    def _send_backspaces(n: int):
+        """
+        Send `n` Backspace key events. Used by rolling cleanup to remove
+        live-pasted raw text before pasting the AI-cleaned version.
+        Virtual keycode 51 = kVK_Delete (Backspace on US keyboards).
+        """
+        if n <= 0:
+            return
+        src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+        for _ in range(n):
+            ev_dn = Quartz.CGEventCreateKeyboardEvent(src, 51, True)
+            ev_up = Quartz.CGEventCreateKeyboardEvent(src, 51, False)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_dn)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_up)
+            # Tiny delay so receiving apps don't drop events under load.
+            # 1ms x 1000 chars = 1s — acceptable for typical dictations.
+            time.sleep(0.001)
+
+    def _replace_streaming_text(self, target: str) -> bool:
+        """
+        Diff what we've live-pasted (`self._stream_pasted_text`) against
+        `target` and apply minimal edits: backspace the divergent suffix,
+        paste the new tail. Common prefix is left untouched so the user
+        sees the smallest possible flicker.
+
+        Returns True if any text was actually pasted.
+        """
+        old = self._stream_pasted_text or ""
+        new = target or ""
+
+        # Common prefix
+        i = 0
+        max_i = min(len(old), len(new))
+        while i < max_i and old[i] == new[i]:
+            i += 1
+
+        chars_to_delete = len(old) - i
+        tail_to_paste   = new[i:]
+
+        if chars_to_delete == 0 and not tail_to_paste:
+            return False
+
+        if chars_to_delete:
+            print(f"[stream] backspacing {chars_to_delete} chars",
+                  flush=True)
+            self._send_backspaces(chars_to_delete)
+            # Give the receiving app a beat to process the deletion before
+            # we slam Cmd+V at it (some apps queue keyboard events on
+            # the main thread and racing them produces "first char eaten").
+            time.sleep(0.02)
+
+        if tail_to_paste:
+            print(f"[stream] pasting cleaned tail of {len(tail_to_paste)} chars",
+                  flush=True)
+            self._paste(tail_to_paste)
+
+        # Track final state for any subsequent revision pass (none expected
+        # in the current design but cheap to keep accurate).
+        self._stream_pasted_text = new
+        return True
+
+    # ── Phase 2: light intermediate cleanup ────────────────────────────────
+    #
+    # Debounced AI cleanup that fires ~2s after the user stops dictating a
+    # fragment. Polishes the live preview while the user is still talking,
+    # so the final replace at fn release has less to fix → less flicker.
+    #
+    # Lifecycle:
+    #   • Each intermediate paste resets the timer to 2s.
+    #   • If a new fragment arrives first, the timer is replaced.
+    #   • If the timer fires, _run_light_cleanup snapshots the pasted
+    #     text, runs AI cleanup under _ai_busy_lock, then applies the
+    #     replace ONLY IF the snapshot still matches (no race with a new
+    #     fragment).
+    #   • At fn release, the streaming-final branch cancels the timer and
+    #     acquires the lock for the heavy cleanup.
+
+    LIGHT_CLEANUP_DEBOUNCE_S = 2.0
+    LIGHT_CLEANUP_MIN_CHARS  = 25
+
+    def _schedule_light_cleanup(self):
+        """(Re)arm the debounced cleanup timer."""
+        if not self._ai.is_enabled():
+            return
+        if self._light_cleanup_timer is not None:
+            try:
+                self._light_cleanup_timer.cancel()
+            except Exception:
+                pass
+        timer = threading.Timer(self.LIGHT_CLEANUP_DEBOUNCE_S,
+                                self._run_light_cleanup)
+        timer.daemon = True
+        self._light_cleanup_timer = timer
+        timer.start()
+
+    def _run_light_cleanup(self):
+        """Run AI cleanup over current pasted text. Replace if changed."""
+        try:
+            self._light_cleanup_timer = None
+
+            # Snapshot: must still match when we go to apply the replace.
+            snapshot = self._stream_pasted_text or ""
+            if len(snapshot) < self.LIGHT_CLEANUP_MIN_CHARS:
+                return
+            if not self._ai.is_enabled():
+                return
+
+            # Try-acquire the AI lock without blocking. If a final cleanup
+            # is already running (or another light cleanup), skip this
+            # round — the caller's debounce will fire again on next pause.
+            if not self._ai_busy_lock.acquire(blocking=False):
+                print("[stream-light] AI busy, skipping this round", flush=True)
+                return
+            try:
+                lang = self._stream_lang_lock or self._language
+                ts = time.monotonic()
+                cleaned = self._ai.clean(
+                    snapshot,
+                    app_bundle = self._frontmost_app_bundle(),
+                    language   = lang,
+                    force      = True,
+                )
+                dt = time.monotonic() - ts
+            finally:
+                self._ai_busy_lock.release()
+
+            if not cleaned or not cleaned.strip():
+                return
+            cleaned = cleaned.strip()
+
+            # Race check: if pasted text changed since snapshot, abort
+            # so we don't clobber a fresh fragment the user just dictated.
+            if self._stream_pasted_text != snapshot:
+                print(f"[stream-light] snapshot stale ({len(snapshot)} → "
+                      f"{len(self._stream_pasted_text)} chars), aborting",
+                      flush=True)
+                return
+
+            if cleaned == snapshot:
+                return
+
+            print(f"[stream-light] {dt:.2f}s "
+                  f"({len(snapshot)} → {len(cleaned)} chars), applying",
+                  flush=True)
+            # Re-check race AFTER the diff/apply call too (replace itself
+            # is a sequence of system events, not atomic).
+            if self._stream_pasted_text == snapshot:
+                self._replace_streaming_text(cleaned)
+        except Exception as e:
+            print(f"[stream-light] failed: {e}", file=sys.stderr, flush=True)
 
     # ══════════════════════════════════════════════════════════════════════════
     # UTILITIES
