@@ -24,6 +24,7 @@ What's new in v2
 • Smart capitalisation after sentence-ending punctuation
 """
 
+import collections
 import json
 import os
 import re
@@ -85,10 +86,9 @@ INITIAL_PROMPTS = {
 
 MODELS = [
     # (id, display label)
-    ("tiny",           "tiny · 75 MB · fastest"),
-    ("base",           "base · 145 MB · balanced"),
-    ("small",          "small · 465 MB · good"),
-    ("medium",         "medium · 1.5 GB · very good"),
+    # tiny/base/small/medium removed — large-v3-turbo is universally
+    # better at near-equal speed on Apple Silicon. Kept the two large
+    # variants for users who specifically need maximum accuracy.
     ("large-v3-turbo", "large-v3-turbo · 1.6 GB · recommended"),
     ("large-v3",       "large-v3 · 3.0 GB · most accurate"),
 ]
@@ -149,16 +149,23 @@ BACKENDS = [
     # (id, display label)
     ("faster-whisper", "faster-whisper · CPU int8 · universal"),
     ("mlx-whisper",    "mlx-whisper · Apple Silicon GPU · fastest"),
+    ("voxtral",        "voxtral mini 3B · MLX · best quality + speed"),
 ]
 
 LOCAL_LLMS = [
     # (id,             hf-repo,                                            expected_bytes, label)
-    ("llama-3.2-1b",  "mlx-community/Llama-3.2-1B-Instruct-4bit",    700_000_000,  "Llama 3.2 1B  ·  fastest  (~0.2 s)"),
-    ("qwen2.5-1.5b",  "mlx-community/Qwen2.5-1.5B-Instruct-4bit",    900_000_000,  "Qwen2.5 1.5B  ·  fast  (~0.3 s)"),
+    # Llama 3.x lineage removed (legacy): Qwen2.5 covers the same
+    # speed/quality range with measurably better Italian. OLMoE + Gemma 3
+    # cover the modern small alternatives.
+    ("qwen2.5-1.5b",  "mlx-community/Qwen2.5-1.5B-Instruct-4bit",    900_000_000,  "Qwen2.5 1.5B  ·  fastest  (~0.3 s)"),
+    # OLMoE 1B-7B: 7B total, only 1.3B active per token via MoE routing.
+    # Runs at ~1.3B-model speed with 7B-model knowledge. Good for tight RAM.
+    ("olmoe-1b-7b",   "mlx-community/OLMoE-1B-7B-0125-Instruct-4bit", 3_500_000_000, "OLMoE 1B/7B MoE  ·  fast + bigger knowledge  (~0.5 s, ~3.5 GB)"),
+    # Gemma 3 4B Instruct: dense, lightweight, strong at multilingual
+    # including Italian. Newer training data than Qwen 2.5.
+    ("gemma-3-4b",    "mlx-community/gemma-3-4b-it-4bit",            2_500_000_000, "Gemma 3 4B  ·  modern dense, multilingual  (~0.8 s, ~2.5 GB)"),
     ("qwen2.5-3b",    "mlx-community/Qwen2.5-3B-Instruct-4bit",    1_800_000_000,  "Qwen2.5 3B  ·  balanced  (~0.7 s, recommended)"),
     ("qwen2.5-7b",    "mlx-community/Qwen2.5-7B-Instruct-4bit",    4_200_000_000,  "Qwen2.5 7B  ·  best quality  (~2 s)"),
-    ("llama-3.2-3b",  "mlx-community/Llama-3.2-3B-Instruct-4bit",  1_700_000_000,  "Llama 3.2 3B  ·  legacy"),
-    ("llama-3.1-8b",  "mlx-community/Llama-3.1-8B-Instruct-4bit",  4_500_000_000,  "Llama 3.1 8B  ·  highest quality  (~3 s)"),
 ]
 DEFAULT_LOCAL_LLM = "qwen2.5-1.5b"
 
@@ -222,7 +229,11 @@ DEFAULT_CONFIG = {
     "llm_model":       DEFAULT_LOCAL_LLM,
     "show_hud":        True,
     "user_dictionary": [],              # list of names/terms to bias Whisper toward
-    "hybrid_quality_for_ru_ar": True,   # auto-promote turbo → large-v3 for ru/ar
+    # Auto-promote turbo → large-v3 in two cases:
+    #  • when the user dictates in ru/ar (turbo is much worse on those)
+    #  • on the final batch of a streaming session (live preview keeps
+    #    turbo for speed; the final paste gets large-v3 for accuracy)
+    "hybrid_quality_for_ru_ar": True,
     # Streaming dictation: during press-and-hold, segment audio at silence
     # boundaries (Silero VAD ~1.5s pause) and run transcription + AI cleanup
     # in parallel while the user is still talking. Each completed sentence
@@ -285,6 +296,9 @@ class Recorder:
 
     def start(self, hands_free: bool = False, on_utterance=None):
         with self._lock:
+            print(f"[recorder.start] resetting session buf (had "
+                  f"{sum(c.size for c in self._session_buf) / SAMPLE_RATE:.2f}s)",
+                  flush=True)
             self._buf           = []
             self._session_buf   = []
             self._hands_free    = hands_free
@@ -445,6 +459,16 @@ class AICleanup:
         self._mlx_loaded_repo = None
         self._mlx_lock        = threading.Lock()
         self._mlx_warming     = False     # background pre-warm in flight?
+        # Used by the codex backend; previously initialized as dead code
+        # AFTER a return statement, which caused
+        #   AttributeError: 'AICleanup' object has no attribute '_codex_path'
+        # whenever the user picked Codex as the AI backend.
+        self._codex_path      = self._find_codex()
+        # When Codex returns a rate-limit error, we cache the cooldown
+        # timestamp here so subsequent cleanups skip codex entirely (and
+        # waste no 7-second round-trip on the failing CLI). Reset to 0
+        # means "no cooldown active".
+        self._codex_cooldown_until = 0.0
 
     @property
     def llm_id(self) -> str:
@@ -456,7 +480,6 @@ class AICleanup:
         if self._mlx_model is not None and self._mlx_loaded_repo == wanted_repo:
             return True
         return _is_llm_downloaded(self.llm_id)
-        self._codex_path    = self._find_codex()
 
     @property
     def backend(self) -> str:
@@ -545,12 +568,22 @@ class AICleanup:
             "  • Preserve the speaker's exact wording, register, and content.\n"
             "\n"
             "STRICTLY DO NOT:\n"
-            "  • Do NOT add words that aren't in the input. Specifically NEVER prepend "
-            "\"Ok\", \"Allora\", \"So\", \"Well\", \"Cioè\" as transitions if the speaker "
-            "didn't say them. NEVER insert connectives like \". Ok,\" between fragments.\n"
+            "  • Preserve EVERY word from the input. Do not delete, replace, or "
+            "merge content words. Your job is punctuation and capitalization, "
+            "NOT content editing. If a word is in the input, it must appear in "
+            "the output (in the same form, possibly recapitalized).\n"
+            "  • CRITICAL: leading interjections (Ascolta, Senti, Guarda, "
+            "Allora, Dunque, Ok, Ciao, Salve, Pronto) are CONTENT words the "
+            "speaker said. ALWAYS keep them. Add a comma after them, but "
+            "NEVER drop them.\n"
+            "  • Word-count rule: the output must contain at least as many "
+            "content words as the input. If you find yourself shortening, "
+            "stop and just polish punctuation instead.\n"
+            "  • Do NOT add new words that aren't already in the input. Do not "
+            "insert transitional connectors that the speaker didn't say.\n"
             "  • Do NOT shorten, summarize, or rephrase. Same words, just polished.\n"
             "  • Do NOT translate. Do NOT change the meaning.\n"
-            "  • Do NOT use em-dashes (—) or en-dashes (–). Use commas, periods, or "
+            "  • Do NOT use em-dashes or en-dashes. Use commas, periods, or "
             "parentheses.\n"
             "  • Do NOT add markdown, quotation marks around the whole thing, "
             "explanations, or commentary.\n"
@@ -585,6 +618,98 @@ class AICleanup:
         before = text[: first + 1]
         after  = text[first + 1 :].replace("!", ".")
         return before + after
+
+    # Filler words that the cleanup is ALLOWED to drop from the start —
+    # they don't carry meaning. Anything else at the start IS meaningful
+    # and must survive the cleanup. NOTE: "boh" is intentionally EXCLUDED
+    # — users sometimes say it as content ("Boh, non lo so"), and dropping
+    # it has caused complaints. Better to keep it.
+    _START_FILLERS = {
+        "ehm", "uhm", "um", "uh", "ah", "eh", "mmm", "mm",
+        "tipo", "cioè", "insomma", "diciamo",
+    }
+
+    @classmethod
+    def _preserve_leading_interjection(cls, original: str, cleaned: str):
+        """
+        Detect if the AI dropped the start of the input. Two failure modes:
+
+        1. AI dropped a SINGLE word at the start (interjection, opener):
+           we can prepend it back without losing content.
+
+        2. AI dropped a WHOLE PHRASE at the start (multiple content words):
+           prepending one word would still lose 90% of the phrase. In that
+           case we have no good fix here — return None to signal the
+           caller to REJECT the AI cleanup entirely and fall back to the
+           original transcript (no cleanup, but no cropping either).
+
+        Returns:
+            cleaned (str) — if the start is preserved, or fixed with prepend
+            None         — if AI mangled the start beyond recovery; caller
+                           should discard cleaned and use original instead
+        """
+        if not original or not cleaned:
+            return cleaned
+
+        # Walk past leading fillers in the input to find the first real
+        # content word (the one the user actually meant).
+        words = original.lstrip().split()
+        if not words:
+            return cleaned
+        # Pick the first content word + a SUBSTANTIVE (≥4 char) second
+        # content word. Short words like "se", "ma", "ok", "ho" appear all
+        # over the place and cause false-positive matches that fool the
+        # reject check (the AI dropped a phrase but our check finds a
+        # 2-letter word elsewhere and decides everything is fine).
+        first_word = None
+        second_substantive = None
+        for w in words:
+            clean_w = w.strip(",.!?;:'\"()-—–…").lower()
+            if not clean_w:
+                continue
+            if first_word is None:
+                if clean_w in cls._START_FILLERS:
+                    continue
+                first_word = w.strip(",.!?;:'\"()-—–…")
+                continue
+            # Looking for second SUBSTANTIVE word now (≥ 4 chars).
+            if len(clean_w) >= 4:
+                second_substantive = w.strip(",.!?;:'\"()-—–…")
+                break
+        if first_word is None:
+            return cleaned
+
+        first_lower = first_word.lower()
+
+        # If the cleaned output already contains the first content word
+        # near the start, we're fine — no fix needed.
+        head = cleaned.lstrip()[:60].lower()
+        import re as _re
+        if _re.search(r"\b" + _re.escape(first_lower) + r"\b", head):
+            return cleaned
+
+        # First word is missing. How serious is the loss?
+        # If the second SUBSTANTIVE word is ALSO missing, the AI dropped
+        # a whole opening phrase — single-word prepend won't recover it.
+        # Signal rejection so caller falls back to raw transcript.
+        if second_substantive is not None:
+            second_lower = second_substantive.lower()
+            if not _re.search(r"\b" + _re.escape(second_lower) + r"\b", head):
+                print(f"[ai] AI dropped opening phrase "
+                      f"('{first_word}' AND '{second_substantive}' missing) — "
+                      f"rejecting cleanup, using raw transcript",
+                      file=sys.stderr, flush=True)
+                return None  # caller will fall back to original
+
+        # Only the first word is missing — the AI kept the rest intact.
+        # Safe to prepend back.
+        rest = cleaned.lstrip().lstrip(",").lstrip()
+        if rest and rest[0].isalpha() and rest[0].isupper():
+            rest = rest[0].lower() + rest[1:]
+        fixed = first_word.capitalize() + ", " + rest
+        print(f"[ai] re-prepending dropped first word "
+              f"'{first_word.capitalize()}'", file=sys.stderr, flush=True)
+        return fixed
 
     @staticmethod
     def _looks_invented(original: str, cleaned: str) -> bool:
@@ -717,6 +842,16 @@ class AICleanup:
                 return text
             if cleaned:
                 cleaned = self._tone_down_punctuation(cleaned)
+                # Defensive: small LLMs sometimes drop the start of the input.
+                # If only a single word, we re-prepend. If a whole phrase,
+                # we get None back — discard cleanup, use raw transcript.
+                preserved = self._preserve_leading_interjection(text, cleaned)
+                if preserved is None:
+                    # AI dropped opening phrase — too much loss to recover.
+                    # Return original transcript unchanged. User said
+                    # "disable the initial crop, it does more harm than good".
+                    return text
+                cleaned = preserved
             # _strip_meta returns "" when the model went off the rails entirely.
             if not cleaned:
                 print(f"[ai] cleanup output rejected (too inflated) — "
@@ -741,6 +876,16 @@ class AICleanup:
              "Allora, voglio un'icona dinamica sulla taskbar che mi fa vedere lo stato di avanzamento del mio utilizzo di Codex."),
             ("ciao cuore fantastico benissimo. sono molto contento. che cosi ci rivediamo",
              "Ciao cuore, fantastico, benissimo. Sono molto contento che così ci rivediamo."),
+            # CRITICAL: leading interjections like "Ascolta", "Senti", "Allora",
+            # "Guarda", "Dunque", "Ok" are CONTENT words spoken by the user.
+            # They must be PRESERVED, not removed. The cleanup adds a comma
+            # after them and capitalizes only.
+            ("ascolta hai fatto per caso quei robi che ha chiesto la elena ieri",
+             "Ascolta, hai fatto per caso quei robi che ha chiesto la Elena ieri?"),
+            ("senti ti volevo dire che la riunione di domani è spostata",
+             "Senti, ti volevo dire che la riunione di domani è spostata."),
+            ("guarda non lo so cosa fare in questo caso",
+             "Guarda, non lo so cosa fare in questo caso."),
         ],
         "en": [
             ("um so I was thinking about uh the project we discussed yesterday",
@@ -895,6 +1040,10 @@ class AICleanup:
     def _clean_codex(self, sys_prompt: str, text: str, timeout: float = 8) -> str | None:
         if not self._codex_path:
             return None
+        # Short-circuit while Codex is rate-limited. Avoids wasting a
+        # 7-second round-trip on every dictation just to get rc=1 again.
+        if time.time() < self._codex_cooldown_until:
+            return None
         out_file = "/tmp/.flow_codex_out"
         try:
             t0 = time.time()
@@ -906,10 +1055,35 @@ class AICleanup:
                 text           = True,
                 timeout        = timeout,
             )
-            print(f"[ai-codex] {time.time()-t0:.2f}s rc={r.returncode}", flush=True)
+            dt = time.time() - t0
+            print(f"[ai-codex] {dt:.2f}s rc={r.returncode}", flush=True)
             if r.returncode == 0 and os.path.exists(out_file):
                 with open(out_file) as f:
                     return self._strip_meta(f.read().strip(), text)
+            # Surface why codex failed so the user can act on it (auth,
+            # rate limit, CLI flag change, etc.). Truncate stderr to avoid
+            # flooding the log on huge tracebacks.
+            err = ((r.stderr or "") + (r.stdout or "")).strip()[:800]
+            err_lower = err.lower()
+            if err:
+                print(f"[ai-codex] stderr: {err}", file=sys.stderr, flush=True)
+            # Detect rate-limit / quota and put codex on a 30-minute cooldown
+            # so we don't spam the API and don't add 7s latency to every
+            # dictation. After cooldown we'll try again automatically.
+            if any(k in err_lower for k in (
+                "usage limit", "rate limit", "quota", "too many requests",
+                "429",
+            )):
+                self._codex_cooldown_until = time.time() + 30 * 60
+                try:
+                    rumps.notification(
+                        "Flow", "Codex rate-limited",
+                        "Falling back to local LLM for the next 30 min.",
+                    )
+                except Exception:
+                    pass
+                print("[ai-codex] rate-limited — cooldown 30 min",
+                      file=sys.stderr, flush=True)
         except subprocess.TimeoutExpired:
             print("[ai-codex] timeout", file=sys.stderr, flush=True)
         except Exception as e:
@@ -1183,6 +1357,16 @@ class FlowApp(rumps.App):
         # safe to invoke concurrently on the same model.
         self._light_cleanup_timer = None
         self._ai_busy_lock        = threading.Lock()
+        # We consume fn flagsChanged to suppress macOS' built-in fn action
+        # (emoji picker / dictation) so a double-press only triggers Flow
+        # hands-free, NOT the emoji picker. Single-fn no longer opens the
+        # emoji picker — user can use Cmd+Ctrl+Space (the standard macOS
+        # shortcut) for that. The earlier debounced-timer approach caused
+        # confusion (couldn't be closed by re-pressing fn).
+        # Paste lock serializes all paste/replace operations so a light
+        # cleanup mid-replace cannot interleave with a worker paste,
+        # which would garble the text in the user's app.
+        self._paste_lock = threading.RLock()
         self._stop_timer   = threading.Event()
 
         # History  (newest first)
@@ -1206,9 +1390,21 @@ class FlowApp(rumps.App):
         # Pre-warm the local LLM in the background so the first dictation
         # doesn't have to wait for ~1.8 GB to come down from the HF Hub.
         threading.Thread(target=self._prewarm_local_llm, daemon=True).start()
+        # Pre-warm large-v3 in background if hybrid quality is enabled —
+        # the first streaming-final batch will auto-promote turbo→large-v3
+        # and we don't want to pause for a 3 GB download mid-dictation.
+        if (self._cfg.get("hybrid_quality_for_ru_ar", True)
+                and self._cfg.get("backend") in (None, "mlx-whisper")
+                and self._model_name == "large-v3-turbo"):
+            threading.Thread(target=self._prewarm_large_v3, daemon=True).start()
         # Pre-warm Silero VAD (3s load) so the first transcribe doesn't pay it.
         threading.Thread(target=lambda: type(self)._silero_trim(np.zeros(16000, dtype="float32")),
                          daemon=True).start()
+        # Background HF-cache janitor: removes Flow models that have been
+        # dropped from the menu (e.g. when we upgrade the LLM/whisper list).
+        # Conservative: only removes repos in a known-obsolete list to avoid
+        # nuking models used by the user's other projects.
+        threading.Thread(target=self._cleanup_obsolete_models, daemon=True).start()
         # First-run onboarding (only if the marker file doesn't exist yet)
         threading.Thread(target=self._maybe_run_onboarding, daemon=True).start()
 
@@ -1292,6 +1488,151 @@ class FlowApp(rumps.App):
         """Thread-safe NSMenuItem title setter."""
         self._on_main(lambda: setattr(item, "title", title))
 
+    # ── HF cache janitor ───────────────────────────────────────────────────
+    #
+    # When we drop a model from the Flow menu (e.g. retired whisper-small
+    # in favour of large-v3-turbo), the previously-downloaded weights stay
+    # in ~/.cache/huggingface/hub forever. This janitor removes them on
+    # every Flow startup. Strictly opt-in: only repos on _OBSOLETE_REPOS
+    # are touched. Other models (moondream, the user's other projects)
+    # are never deleted.
+
+    _OBSOLETE_REPOS = [
+        # Whisper variants we removed from MODELS list (only large-v3
+        # and large-v3-turbo remain).
+        "mlx-community/whisper-tiny-mlx",
+        "mlx-community/whisper-base-mlx",
+        "mlx-community/whisper-small-mlx",
+        "mlx-community/whisper-medium-mlx",
+        "Systran/faster-whisper-tiny",
+        "Systran/faster-whisper-base",
+        "Systran/faster-whisper-small",
+        "Systran/faster-whisper-medium",
+        # Llama 3.x family removed from LOCAL_LLMS (Qwen + OLMoE + Gemma
+        # cover the same speed/quality range with better Italian).
+        "mlx-community/Llama-3.2-1B-Instruct-4bit",
+        "mlx-community/Llama-3.2-3B-Instruct-4bit",
+        "mlx-community/Llama-3.1-8B-Instruct-4bit",
+    ]
+
+    def _cleanup_obsolete_models(self):
+        try:
+            cache_root = Path.home() / ".cache" / "huggingface" / "hub"
+            if not cache_root.exists():
+                return
+            freed_bytes = 0
+            for repo in self._OBSOLETE_REPOS:
+                d = cache_root / ("models--" + repo.replace("/", "--"))
+                if not d.exists():
+                    continue
+                # Compute size before delete for the log line
+                try:
+                    size_kb = int(subprocess.run(
+                        ["du", "-sk", str(d)],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.split()[0])
+                    size_b = size_kb * 1024
+                except Exception:
+                    size_b = 0
+                try:
+                    import shutil
+                    shutil.rmtree(d, ignore_errors=True)
+                    # Also nuke the lock dir so HF doesn't recreate orphan
+                    # symlinks pointing nowhere.
+                    lock_d = cache_root / ".locks" / d.name
+                    if lock_d.exists():
+                        shutil.rmtree(lock_d, ignore_errors=True)
+                    freed_bytes += size_b
+                    print(f"[janitor] removed obsolete {repo} "
+                          f"({size_b / 1e9:.2f} GB)", flush=True)
+                except Exception as e:
+                    print(f"[janitor] failed to remove {repo}: {e}",
+                          file=sys.stderr, flush=True)
+            if freed_bytes > 100_000_000:  # ≥ 100 MB freed → notify
+                try:
+                    rumps.notification(
+                        "Flow", "Disk cleanup",
+                        f"Reclaimed {freed_bytes / 1e9:.1f} GB of obsolete "
+                        f"model weights from the HuggingFace cache.",
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[janitor] unexpected error: {e}",
+                  file=sys.stderr, flush=True)
+
+    # ── Download progress (ETA + MB/s) ─────────────────────────────────────
+    #
+    # Generic helper: ensure a HuggingFace repo is cached locally; if not,
+    # trigger snapshot_download and surface live progress (percent, MB/s,
+    # ETA) in the menu-bar status item title. Idempotent — returns
+    # immediately if the repo is already on disk.
+    def _ensure_model_downloaded(self, repo: str, expected_bytes: int,
+                                 label: str) -> None:
+        cur = _hf_cache_bytes(repo)
+        # 95% threshold accounts for HF cache structure overhead (blobs +
+        # snapshot symlinks aren't included in the published model size).
+        if expected_bytes > 0 and cur >= int(expected_bytes * 0.95):
+            return  # already cached, nothing to download
+
+        stop = threading.Event()
+        start_t = time.monotonic()
+
+        def _monitor():
+            last_size = cur
+            last_t    = start_t
+            while not stop.wait(0.7):
+                size = _hf_cache_bytes(repo)
+                now  = time.monotonic()
+                # Speed window: rate over last poll interval
+                delta_b = max(0, size - last_size)
+                delta_t = max(0.001, now - last_t)
+                rate_bps = delta_b / delta_t
+                last_size, last_t = size, now
+
+                pct = min(100, int(100 * size / max(expected_bytes, 1)))
+                mb_per_s = rate_bps / 1e6
+                # ETA: only meaningful when actively downloading
+                if rate_bps > 50_000:  # > 50 kB/s
+                    remaining = max(0, expected_bytes - size)
+                    eta_sec   = remaining / rate_bps
+                    if eta_sec < 60:
+                        eta = f"{int(eta_sec)}s"
+                    elif eta_sec < 3600:
+                        eta = f"{int(eta_sec // 60)}m{int(eta_sec % 60):02d}s"
+                    else:
+                        eta = f"{int(eta_sec // 3600)}h{int((eta_sec % 3600) // 60):02d}m"
+                    title = (f"⬇ {label} {pct}%  ·  "
+                             f"{mb_per_s:.1f} MB/s  ·  ETA {eta}")
+                else:
+                    # Just-started or stalled — no rate yet
+                    title = f"⬇ {label} {pct}%"
+                self._set_menu_title(self._status_item, title)
+
+        thread = threading.Thread(target=_monitor, daemon=True)
+        thread.start()
+        try:
+            # One-time notification so the user knows something heavy
+            # is in flight (especially on first launch).
+            try:
+                rumps.notification(
+                    "Flow", f"Downloading {label}",
+                    f"~{expected_bytes / 1e9:.1f} GB. Progress shown in menu bar.",
+                )
+            except Exception:
+                pass
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=repo)
+        except Exception as e:
+            print(f"[download] {label} failed: {e}",
+                  file=sys.stderr, flush=True)
+        finally:
+            stop.set()
+            try:
+                thread.join(timeout=2)
+            except Exception:
+                pass
+
     def _apply_state(self, state: str, suffix: str = ""):
         """
         Update the menu-bar status item to show the icon (and optional text
@@ -1330,7 +1671,12 @@ class FlowApp(rumps.App):
         # Native checkmark from rumps (item.state) marks the active row — no
         # manual ✓ in the description, no leading-spaces hack.
         self._model_items: dict[str, rumps.MenuItem] = {}
+        # Title is updated dynamically in _refresh_whisper_menu_visibility()
+        # to "Whisper Model (n/a — Voxtral)" when the user picks Voxtral as
+        # backend, since Voxtral has its own bundled model and ignores the
+        # Whisper Model setting entirely.
         model_menu = rumps.MenuItem("Whisper Model")
+        self._whisper_model_menu = model_menu
         for name, desc in MODELS:
             item             = rumps.MenuItem(desc, callback=self._cb_set_model)
             item._flow_model = name
@@ -1394,7 +1740,7 @@ class FlowApp(rumps.App):
         self._hud_item.state = self._cfg.get("show_hud", True)
 
         self._hybrid_item = rumps.MenuItem(
-            "Hi-quality for RU/AR  (use large-v3)",
+            "Hi-quality batch  (use large-v3 for final + ru/ar)",
             callback=self._cb_toggle_hybrid,
         )
         self._hybrid_item.state = self._cfg.get("hybrid_quality_for_ru_ar", True)
@@ -1457,6 +1803,9 @@ class FlowApp(rumps.App):
             None,
             rumps.MenuItem("Quit Flow", callback=lambda _: rumps.quit_application()),
         ]
+
+        # Reflect saved backend in the Whisper Model title (n/a for voxtral)
+        self._refresh_whisper_menu_visibility()
 
     # ══════════════════════════════════════════════════════════════════════════
     # MENU CALLBACKS
@@ -1541,7 +1890,24 @@ class FlowApp(rumps.App):
             self._model = None
         self._set_menu_title(self._status_item, f"Switching backend to {name}…")
         self._apply_state(self._STATE_LOADING)
+        self._refresh_whisper_menu_visibility()
         threading.Thread(target=self._load_model, daemon=True).start()
+
+    def _refresh_whisper_menu_visibility(self):
+        """
+        Voxtral has its own bundled model and ignores the Whisper Model
+        selection. Reflect that in the menu title so the user understands
+        the setting is N/A in that mode.
+        """
+        if not hasattr(self, "_whisper_model_menu"):
+            return
+        if self._backend == "voxtral":
+            new_title = "Whisper Model  (n/a — Voxtral has its own model)"
+        else:
+            new_title = "Whisper Model"
+        self._on_main(
+            lambda: setattr(self._whisper_model_menu, "title", new_title)
+        )
 
     def _cb_toggle_sound(self, sender):
         sender.state               = not sender.state
@@ -1750,7 +2116,24 @@ class FlowApp(rumps.App):
                 NO_SUFFIX = {"large-v3-turbo"}
                 repo_name = name if name in NO_SUFFIX else f"{name}-mlx"
                 repo = f"mlx-community/whisper-{repo_name}"
+                # Pre-download with progress so the user sees ETA + MB/s,
+                # not a silent hang on the first dictation.
+                EXPECTED = {
+                    "large-v3-turbo": 1_600_000_000,
+                    "large-v3":       3_000_000_000,
+                }.get(name, 1_500_000_000)
+                self._ensure_model_downloaded(repo, EXPECTED, name)
                 model = ("mlx", repo)
+            elif backend == "voxtral":
+                # Voxtral Mini 3B — Mistral's STT model, native Italian,
+                # ~2.7x faster than Whisper Large-v3, lower hallucination
+                # rate, better punctuation. Uses mlx-voxtral wrapper.
+                # Pre-quantized 4-bit checkpoint, ~3.2 GB on disk.
+                import mlx_voxtral  # noqa — import test only
+                repo = "mzbac/voxtral-mini-3b-4bit-mixed"
+                self._ensure_model_downloaded(repo, 3_200_000_000,
+                                              "Voxtral Mini 3B")
+                model = ("voxtral", repo)
             else:
                 from faster_whisper import WhisperModel
                 model = ("fw", WhisperModel(name, device="auto", compute_type="int8"))
@@ -1763,6 +2146,65 @@ class FlowApp(rumps.App):
             self._set_menu_title(self._status_item, f"Model error: {e}")
             rumps.notification("Flow", "Model failed to load", str(e))
             print(f"[model] load failed ({backend}/{name}): {e}", file=sys.stderr, flush=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # VOXTRAL ADAPTER
+    # ══════════════════════════════════════════════════════════════════════════
+    #
+    # Voxtral expects audio as a file path (its mel-spectrogram pipeline
+    # reads via librosa). We convert the in-memory np.ndarray to a temp WAV
+    # the first call, run process_audio_for_voxtral + model.generate, and
+    # decode the tokens to text via the processor's tokenizer.
+
+    def _voxtral_transcribe(self, model_repo: str, audio: np.ndarray,
+                            lang: "str | None") -> "tuple[str, str | None]":
+        # mlx-voxtral 0.0.4 does `mlx_lm.utils.quantize_model` at module
+        # import time, but new mlx_lm doesn't expose `utils` as an
+        # attribute on the package (Python module-import lock can also
+        # leave the attribute unset under threading deadlocks at startup).
+        # We force-set it from sys.modules so the access at quantization.py:13
+        # always succeeds.
+        import sys, importlib
+        import mlx_lm
+        if not hasattr(mlx_lm, "utils"):
+            mlx_lm.utils = importlib.import_module("mlx_lm.utils")
+        # Belt and braces: even if hasattr returned True, replace with
+        # sys.modules version to ensure quantize_model is on it.
+        if "mlx_lm.utils" in sys.modules:
+            setattr(mlx_lm, "utils", sys.modules["mlx_lm.utils"])
+        from mlx_voxtral import load_voxtral_model, VoxtralProcessor
+
+        # Lazy-load the model + processor once per session, cache on self.
+        vx = getattr(self, "_voxtral_model", None)
+        if vx is None:
+            vx_model, vx_cfg = load_voxtral_model(model_repo, lazy=True)
+            vx_proc = VoxtralProcessor.from_pretrained(model_repo)
+            self._voxtral_model     = (vx_model, vx_cfg, vx_proc)
+            vx = self._voxtral_model
+        model, cfg, processor = vx
+
+        # apply_transcrition_request builds the full Voxtral chat template
+        # (INST → BEGIN_AUDIO → AUDIO → TRANSCRIBE) and returns a
+        # `TranscriptionInputs` dataclass with attributes input_ids /
+        # input_features (NOT a dict — `**inputs` raises TypeError).
+        # We pass them as named keyword args explicitly.
+        inputs = processor.apply_transcrition_request(
+            audio,
+            language      = lang,            # None = auto-detect
+            sampling_rate = SAMPLE_RATE,
+        )
+        out_ids = model.generate(
+            input_ids      = inputs.input_ids,
+            input_features = inputs.input_features,
+        )
+        txt = processor.batch_decode(out_ids, skip_special_tokens=True)
+        if isinstance(txt, list):
+            txt = " ".join(t for t in txt if t)
+        text = (txt or "").strip()
+
+        # Voxtral doesn't expose detected_lang the way Whisper does; we
+        # fall back to whatever the user/lang-lock specified.
+        return text, (lang or None)
 
     # ══════════════════════════════════════════════════════════════════════════
     # GLOBAL HOTKEY (CGEventTap)
@@ -1819,6 +2261,8 @@ class FlowApp(rumps.App):
                 if etype == Quartz.kCGEventFlagsChanged:
                     flags = Quartz.CGEventGetFlags(event)
                     fn_now = bool(flags & HOTKEY_FLAG)
+                    fn_state_changed = (fn_now != app._fn_down)
+
                     if fn_now and not app._fn_down:
                         app._fn_down = True
                         # Run the press handler on a worker thread so the
@@ -1829,6 +2273,15 @@ class FlowApp(rumps.App):
                     elif not fn_now and app._fn_down:
                         app._fn_down = False
                         threading.Thread(target=app._on_fn_release, daemon=True).start()
+
+                    # CONSUME the event when fn state changed, so macOS
+                    # doesn't fire its built-in fn action (emoji picker /
+                    # dictation / change input source). Other modifier
+                    # events (shift, cmd, control alone) flow through
+                    # unchanged because their fn_now value matches our
+                    # _fn_down → no state change.
+                    if fn_state_changed:
+                        return None
             except Exception as e:
                 print(f"[tap] cb error: {e}", file=sys.stderr, flush=True)
             return event
@@ -1837,12 +2290,15 @@ class FlowApp(rumps.App):
         # Listening to keyDown/keyUp added load to the cb without benefit.
         mask = Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
 
-        # ListenOnly = passive observer, no event filtering. Lower latency
-        # and macOS is far less aggressive about disabling listen-only taps.
+        # Default (active) mode so we can return None to consume fn events
+        # — required to suppress macOS' built-in fn action (emoji picker /
+        # dictation). We dispatch _on_fn_press/_release on background threads
+        # so the callback returns in microseconds, well under the timeout
+        # threshold that previously caused macOS to disable the tap.
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
-            Quartz.kCGEventTapOptionListenOnly,
+            Quartz.kCGEventTapOptionDefault,
             mask,
             _cb, None,
         )
@@ -1987,6 +2443,14 @@ class FlowApp(rumps.App):
         full_audio = self._recorder.get_session_audio()
         # Stop the stream + drain trailing buffer.
         _trailing = self._recorder.stop()
+        # Diagnostic: track if get_session_audio is delivering the right
+        # amount. Bug seen in the wild where final batch only had 1.77s
+        # despite 8s+ of intermediate audio earlier in the same session.
+        print(f"[stop] was_streaming={was_streaming} "
+              f"full_audio={full_audio.size/SAMPLE_RATE:.2f}s "
+              f"trailing={_trailing.size/SAMPLE_RATE:.2f}s "
+              f"raw_buf_len={len(self._stream_raw_buffer)}",
+              flush=True)
 
         if was_streaming and self._stream_raw_buffer:
             # Streaming session: discard the trailing slice and use the FULL
@@ -2213,17 +2677,29 @@ class FlowApp(rumps.App):
                     # don't aggressively drop quiet passages, condition on
                     # previous text for cross-30s-chunk continuity.
                     import mlx_whisper
-                    # Hybrid model selection: Whisper Turbo is significantly
-                    # less accurate than Large-v3 on Russian / Arabic. When
-                    # the user is dictating in those languages, transparently
-                    # promote to large-v3-mlx (it caches after first download,
-                    # so swap cost is just a model-load swap, not a download).
+                    # Hybrid model selection. Two triggers, both opt-in via
+                    # hybrid_quality_for_ru_ar (default True):
+                    #   1) ru/ar on ANY transcribe (turbo is markedly worse
+                    #      on those languages).
+                    #   2) the FINAL batch transcribe of a streaming session
+                    #      on any language — turbo is good enough for the
+                    #      live preview but the final paste benefits from
+                    #      large-v3's higher accuracy. Live intermediates
+                    #      keep using turbo for low latency.
                     effective_repo = mdl
-                    if (lang in ("ru", "ar")
-                            and self._model_name == "large-v3-turbo"
-                            and self._cfg.get("hybrid_quality_for_ru_ar", True)):
+                    is_streaming_final = (
+                        is_final
+                        and len(self._stream_raw_buffer) > 0
+                    )
+                    promote = (
+                        self._model_name == "large-v3-turbo"
+                        and self._cfg.get("hybrid_quality_for_ru_ar", True)
+                        and (lang in ("ru", "ar") or is_streaming_final)
+                    )
+                    if promote:
                         effective_repo = "mlx-community/whisper-large-v3-mlx"
-                        print(f"[transcribe] hybrid mode: lang={lang} → "
+                        why = "ru/ar" if lang in ("ru","ar") else "final-batch"
+                        print(f"[transcribe] hybrid mode ({why}): "
                               f"large-v3 (was turbo)", flush=True)
                     result = mlx_whisper.transcribe(
                         audio,
@@ -2242,6 +2718,15 @@ class FlowApp(rumps.App):
                     )
                     text = (result.get("text") or "").strip()
                     detected_lang = result.get("language") or lang
+                elif kind == "voxtral":
+                    # Voxtral Mini 3B (Mistral) — better Italian, fewer
+                    # hallucinations, smarter punctuation than Whisper.
+                    # The mlx-voxtral API works on file paths (mel spectrogram
+                    # pre-processing requires it), so we dump the np.ndarray
+                    # to a temp WAV first.
+                    text, detected_lang = self._voxtral_transcribe(
+                        mdl, audio, lang
+                    )
                 else:
                     # faster-whisper backend (CPU int8)
                     segments, info = mdl.transcribe(
@@ -2327,13 +2812,17 @@ class FlowApp(rumps.App):
                         self._stream_raw_buffer.append(text)
                         # Live paste, leading space between fragments so words
                         # don't collide. The final cleanup will re-tokenize anyway.
+                        # _paste_lock serializes against light-cleanup replace
+                        # so we never interleave a backspace+paste with another
+                        # paste, which would garble the text in the user's app.
                         prefix = "" if self._stream_first_paste else " "
                         live = prefix + text
                         ts_paste = time.monotonic()
-                        self._paste(live)
+                        with self._paste_lock:
+                            self._paste(live)
+                            self._stream_pasted_text += live
                         t["paste_s"]   = time.monotonic() - ts_paste
                         t["chars_out"] = len(live)
-                        self._stream_pasted_text += live
                         self._stream_first_paste = False
                         self._add_to_history(live)
                         print(f"[stream] live raw paste of {len(live)} chars "
@@ -2676,8 +3165,11 @@ class FlowApp(rumps.App):
         trailing silence — distinct from `_strip_trailing_repeat` which only
         catches *consecutive* duplicates.
 
-        Heuristic: last sentence is meaningful (≥3 content words) AND it
-        already appears (or is contained in) any earlier sentence.
+        Heuristic: BOTH last and earlier sentences must be substantial
+        (≥3 content words each) to count as a real echo. Otherwise we'd
+        match Whisper false-starts like "E poi..." against the actual
+        content sentence "E poi anche i link di Instagram..." and wrongly
+        strip the real content.
         """
         if not text or len(text) < 30:
             return text
@@ -2690,10 +3182,19 @@ class FlowApp(rumps.App):
             return text
         for earlier in parts[:-1]:
             e_norm = re.sub(r"[^\w\s']", "", earlier.lower()).strip()
-            # Match if the earlier sentence starts with (or equals) the last
-            # one — captures cases like "X prompt that you wrote..." echoed
-            # at the end as just "X."
-            if e_norm.startswith(last_norm) or last_norm.startswith(e_norm[:len(last_norm)]) and len(last_norm) >= 12:
+            e_words = e_norm.split()
+            # Require the EARLIER sentence to be substantial too — otherwise
+            # a 1-2 word stutter like "E poi..." would match the start of
+            # any sentence beginning with "E poi" and wrongly strip it.
+            if len(e_words) < 3:
+                continue
+            # True echo: the earlier sentence starts with the FULL last
+            # sentence text, OR the last sentence starts with the FULL
+            # earlier sentence text. We require enough characters to be
+            # confident (≥20 chars overlap) and don't allow tiny prefixes.
+            if e_norm.startswith(last_norm) and len(last_norm) >= 20:
+                return " ".join(parts[:-1]).strip()
+            if last_norm.startswith(e_norm) and len(e_norm) >= 20:
                 return " ".join(parts[:-1]).strip()
         return text
 
@@ -2831,27 +3332,18 @@ class FlowApp(rumps.App):
             repo, expected, label = _local_llm_meta(llm_id)
             already = _is_llm_downloaded(llm_id)
 
+            llm_label = label.split('  ·  ')[0]
+
             if not already:
-                size_gb = expected / 1_000_000_000
-                rumps.notification(
-                    "Flow",
-                    f"Downloading {label.split('  ·  ')[0]}",
-                    f"~{size_gb:.1f} GB — first run only.",
-                )
                 if self._cfg.get("show_hud", True):
-                    self._hud.show("downloading", label_override="Downloading model… 0%")
+                    self._hud.show("downloading",
+                                   label_override="Downloading model…")
+                # Use the unified progress helper — shows pct + MB/s + ETA
+                # in the menu bar. Notification is fired by the helper.
+                self._ensure_model_downloaded(repo, expected, llm_label)
 
-                # Spawn a watcher that updates the HUD with % progress while
-                # the actual model download (started below) writes to disk.
-                stop_evt = threading.Event()
-                def _watch():
-                    while not stop_evt.wait(timeout=1.0):
-                        b = _hf_cache_bytes(repo)
-                        pct = min(99, int(100 * b / max(1, expected)))
-                        self._hud.update_label(f"Downloading model… {pct}%")
-                threading.Thread(target=_watch, daemon=True).start()
-
-            # Trigger the actual load (downloads if missing). Reuses the
+            # Trigger the actual load (downloads if missing — but at this
+            # point the helper has already pulled the weights). Reuses the
             # AICleanup lock so a real cleanup request later doesn't double-
             # load the model.
             with self._ai._mlx_lock:
@@ -2865,11 +3357,10 @@ class FlowApp(rumps.App):
                         print(f"[prewarm] failed: {e}", file=sys.stderr, flush=True)
 
             if not already:
-                stop_evt.set()
                 self._hud.hide()
                 rumps.notification(
                     "Flow", "Model ready",
-                    f"{label.split('  ·  ')[0]} loaded — AI cleanup is active.",
+                    f"{llm_label} loaded — AI cleanup is active.",
                 )
         finally:
             with self._llm_dl_lock:
@@ -3182,41 +3673,48 @@ class FlowApp(rumps.App):
         paste the new tail. Common prefix is left untouched so the user
         sees the smallest possible flicker.
 
+        Acquires _paste_lock for the entire backspace+paste sequence, so
+        no other paste operation (worker intermediate, light cleanup) can
+        interleave and garble the user's app.
+
         Returns True if any text was actually pasted.
         """
-        old = self._stream_pasted_text or ""
-        new = target or ""
+        with self._paste_lock:
+            # Re-read pasted text under the lock — it might have been
+            # updated by a worker paste while we were waiting.
+            old = self._stream_pasted_text or ""
+            new = target or ""
 
-        # Common prefix
-        i = 0
-        max_i = min(len(old), len(new))
-        while i < max_i and old[i] == new[i]:
-            i += 1
+            # Common prefix
+            i = 0
+            max_i = min(len(old), len(new))
+            while i < max_i and old[i] == new[i]:
+                i += 1
 
-        chars_to_delete = len(old) - i
-        tail_to_paste   = new[i:]
+            chars_to_delete = len(old) - i
+            tail_to_paste   = new[i:]
 
-        if chars_to_delete == 0 and not tail_to_paste:
-            return False
+            if chars_to_delete == 0 and not tail_to_paste:
+                return False
 
-        if chars_to_delete:
-            print(f"[stream] backspacing {chars_to_delete} chars",
-                  flush=True)
-            self._send_backspaces(chars_to_delete)
-            # Give the receiving app a beat to process the deletion before
-            # we slam Cmd+V at it (some apps queue keyboard events on
-            # the main thread and racing them produces "first char eaten").
-            time.sleep(0.02)
+            if chars_to_delete:
+                print(f"[stream] backspacing {chars_to_delete} chars",
+                      flush=True)
+                self._send_backspaces(chars_to_delete)
+                # Give the receiving app a beat to process the deletion before
+                # we slam Cmd+V at it (some apps queue keyboard events on
+                # the main thread and racing them produces "first char eaten").
+                time.sleep(0.02)
 
-        if tail_to_paste:
-            print(f"[stream] pasting cleaned tail of {len(tail_to_paste)} chars",
-                  flush=True)
-            self._paste(tail_to_paste)
+            if tail_to_paste:
+                print(f"[stream] pasting cleaned tail of {len(tail_to_paste)} chars",
+                      flush=True)
+                self._paste(tail_to_paste)
 
-        # Track final state for any subsequent revision pass (none expected
-        # in the current design but cheap to keep accurate).
-        self._stream_pasted_text = new
-        return True
+            # Track final state for any subsequent revision pass (none expected
+            # in the current design but cheap to keep accurate).
+            self._stream_pasted_text = new
+            return True
 
     # ── Phase 2: light intermediate cleanup ────────────────────────────────
     #
@@ -3287,23 +3785,23 @@ class FlowApp(rumps.App):
                 return
             cleaned = cleaned.strip()
 
-            # Race check: if pasted text changed since snapshot, abort
-            # so we don't clobber a fresh fragment the user just dictated.
-            if self._stream_pasted_text != snapshot:
-                print(f"[stream-light] snapshot stale ({len(snapshot)} → "
-                      f"{len(self._stream_pasted_text)} chars), aborting",
+            # Apply under the paste lock so no worker fragment can be
+            # pasted between our snapshot check and the actual replace.
+            # If the worker DID paste while AI was running, the snapshot
+            # check fails inside the lock and we abort cleanly.
+            with self._paste_lock:
+                if self._stream_pasted_text != snapshot:
+                    print(f"[stream-light] snapshot stale ({len(snapshot)} → "
+                          f"{len(self._stream_pasted_text)} chars), aborting",
+                          flush=True)
+                    return
+
+                if cleaned == snapshot:
+                    return
+
+                print(f"[stream-light] {dt:.2f}s "
+                      f"({len(snapshot)} → {len(cleaned)} chars), applying",
                       flush=True)
-                return
-
-            if cleaned == snapshot:
-                return
-
-            print(f"[stream-light] {dt:.2f}s "
-                  f"({len(snapshot)} → {len(cleaned)} chars), applying",
-                  flush=True)
-            # Re-check race AFTER the diff/apply call too (replace itself
-            # is a sequence of system events, not atomic).
-            if self._stream_pasted_text == snapshot:
                 self._replace_streaming_text(cleaned)
         except Exception as e:
             print(f"[stream-light] failed: {e}", file=sys.stderr, flush=True)

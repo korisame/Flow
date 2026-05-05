@@ -138,7 +138,9 @@ notify "Installing Flow components (~5 min, one-time)…"
     "$VENV/bin/pip" install --quiet \
         "faster-whisper" \
         "mlx-whisper" \
+        "mlx-voxtral" \
         "mlx-lm" \
+        "scipy" \
         "silero-vad" \
         "sounddevice" \
         "numpy" \
