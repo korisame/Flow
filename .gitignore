@@ -1,5 +1,13 @@
-build/
-build_assets/
-*.dmg
-.DS_Store
+.build/
+.swiftpm/
 __pycache__/
+*.pyc
+.DS_Store
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.aiff
+*.wav
+*.log
+stage-*/
