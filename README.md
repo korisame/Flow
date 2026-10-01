@@ -1,39 +1,17 @@
 # Flow
 
-Local voice dictation for macOS, reconstructed in Swift.
+Current version: **2.4.0**. Native macOS SwiftUI dictation app, local Core ML transcription and offline punctuation cleanup.
 
-This repository contains the current Swift app, CLI, Core ML/FluidAudio
-transcriber, local cleanup pipeline, IPC layer, history store, and tests. The
-older Python launcher previously published in this repository was replaced by
-this Swift source tree.
+## Build and verify
 
-## Status
-
-This checkout is a reconstructed source tree, not a byte-for-byte recovery of
-the installed application. `RECOVERY.md` records the recovery boundary and
-the verification performed on 21 September 2026. The active transcription
-backend uses the local Parakeet TDT 0.6B v3 path through FluidAudio; cleanup is
-local and failures preserve the original text.
-
-## Build and test
-
-Requires macOS, Swift/Xcode tooling, and the pinned FluidAudio dependency.
+Requires macOS, Swift/Xcode tooling and the pinned FluidAudio 0.17.3 dependency.
 
 ```sh
 swift test
 swift build -c release
-```
-
-To build a fresh app staging bundle after the release build:
-
-```sh
 CODESIGN_IDENTITY="-" ./make-app.sh
 ```
 
-Use a real local signing identity only on the development machine. No signing
-identity, model weights, audio, history database, or runtime build output is
-part of this repository.
+Transcription uses Parakeet Ultra Core ML pinned to revision `95eaa59a39d4394f047a4dc5cce480388a60d1b6`. The cleanup worker keeps processing local and preserves original text on failure. Model weights, recordings, transcript databases, local settings and compiled binaries are excluded.
 
-## License
-
-MIT — see `LICENSE`.
+The source was reconstructed in September 2026 and subsequently updated to Ultra. The 2.4.0 source and installed app version were reconciled against local sessions on 1 October 2026. Historical recovery limitations are documented in RECOVERY.md.

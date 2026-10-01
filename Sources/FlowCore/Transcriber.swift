@@ -1,12 +1,15 @@
 import Foundation
 import FluidAudio
 
-/// ASR engine: Parakeet TDT 0.6B v3 (CoreML via FluidAudio).
-/// Replaces the Python parakeet-mlx backend with the same model family.
+/// ASR engine: Parakeet Ultra (CoreML via FluidAudio).
 public final class Transcriber {
+    public static let modelRepository = "FluidInference/parakeet-ultra-coreml"
+    public static let modelRevision = "95eaa59a39d4394f047a4dc5cce480388a60d1b6"
+    public static let selectedModelLabel = "\(modelRepository)@\(modelRevision)"
+
     private var asr: AsrManager?
     private var decoderLayers: Int = 2
-    public private(set) var modelLabel = "parakeet-tdt-0.6b-v3-coreml"
+    public let modelLabel = Transcriber.selectedModelLabel
 
     public init() {}
 
@@ -23,7 +26,7 @@ public final class Transcriber {
 
     public var isLoaded: Bool { loadLock.lock(); defer { loadLock.unlock() }; return asr != nil }
 
-    /// Download (first run) and load the v3 CoreML models. Concurrent callers
+    /// Download (first run) and load the pinned Ultra CoreML models. Concurrent callers
     /// share a single in-flight load instead of starting duplicates.
     public func load() async throws {
         loadLock.lock()
@@ -46,7 +49,10 @@ public final class Transcriber {
                 // we just built instead of silently re-holding ~2.7 GB.
                 if stale, let mgr = loaded { Task.detached { await mgr.cleanup() } }
             }
-            let models = try await AsrModels.downloadAndLoad(version: .v3)
+            var revisionOverrides = ModelRegistry.revisionOverrides
+            revisionOverrides[Self.modelRepository] = Self.modelRevision
+            ModelRegistry.revisionOverrides = revisionOverrides
+            let models = try await AsrModels.downloadAndLoad(version: .ultra)
             let mgr = AsrManager(config: .default)
             try await mgr.loadModels(models)
             let layers = await mgr.decoderLayerCount
@@ -109,4 +115,3 @@ public final class Transcriber {
         if let mgr { await mgr.cleanup() }
     }
 }
-

@@ -13,7 +13,12 @@ if arguments.count >= 3 && arguments[1] == "cleanup" {
 } else if arguments.count >= 3 && arguments[1] == "transcribe" {
     let transcriber = Transcriber()
     let result = try await transcriber.transcribe(WavIO.loadAsFlowSamples(URL(fileURLWithPath: arguments[2])))
-    let data = try JSONSerialization.data(withJSONObject: ["text": result.text, "load_s": result.loadS, "asr_s": result.transcribeS], options: [.sortedKeys])
+    let data = try JSONSerialization.data(withJSONObject: [
+        "text": result.text,
+        "model": transcriber.modelLabel,
+        "load_s": result.loadS,
+        "asr_s": result.transcribeS,
+    ], options: [.sortedKeys])
     print(String(decoding: data, as: UTF8.self))
     await transcriber.unload()
 } else if arguments.count >= 3 && arguments[1] == "process" {

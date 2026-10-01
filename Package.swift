@@ -5,7 +5,7 @@ let package = Package(
     name: "FlowSwift",
     platforms: [.macOS(.v14)],
     dependencies: [
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.6"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.17.3"),
     ],
     targets: [
         .target(

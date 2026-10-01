@@ -3,11 +3,3 @@
 __pycache__/
 *.pyc
 .DS_Store
-*.sqlite
-*.sqlite-*
-*.db
-*.db-*
-*.aiff
-*.wav
-*.log
-stage-*/

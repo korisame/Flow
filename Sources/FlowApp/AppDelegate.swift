@@ -5,7 +5,7 @@ import CoreGraphics
 import FlowCore
 
 let APP_NAME = "Flow"
-let APP_VERSION = "2.3.0-recovered"
+let APP_VERSION = "2.4.0"
 let KOFI_URL = "https://ko-fi.com/shaungori"
 let HOTKEY_FLAG: UInt64 = 0x800000       // kCGEventFlagMaskSecondaryFn
 let DOUBLE_PRESS_SEC = 0.45
@@ -132,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run {
                     self.modelReady = true
                     self.setState("idle")
-                    self.updateStatusLine("Parakeet v3 CoreML · FluidAudio · ready")
+                    self.updateStatusLine("Parakeet Ultra CoreML · FluidAudio 0.17.3 · ready")
                     // Free the ~2.7 GB CoreML/ANE footprint if Flow sits idle
                     // after launch without any dictation.
                     self.scheduleAsrIdleUnload()
@@ -563,7 +563,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if tapPermissionNotified {
             tapPermissionNotified = false
-            updateStatusLine(modelReady ? "Parakeet v3 CoreML · FluidAudio · ready" : "Loading model…")
+            updateStatusLine(modelReady ? "Parakeet Ultra CoreML · FluidAudio 0.17.3 · ready" : "Loading model…")
         }
         eventTap = tap
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
@@ -1309,6 +1309,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if includeHealth {
                 payload["available"] = .bool(true)
                 payload["pid"] = .int(Int(getpid()))
+                payload["asrModel"] = .string(self.transcriber.modelLabel)
             }
             return payload
         }

@@ -1,6 +1,6 @@
 # FlowSwift reconstruction
 
-Work in progress, not installed. The installed app is preserved.
+Recovered version 2.3.0 installed on September 21. Live IPC verified idle/modelReady=true. Previous experimental rollback files were removed on 1 October 2026 at the owner's request. Source reconstruction is committed locally; no remote publication.
 
 Sources were reconstructed from local Claude Write/Read/Edit records and the original Codex IPC patch. Mixed historical snapshots require compilation and behavioral verification; this is not a byte-exact recovery of the latest source.
 
@@ -11,3 +11,5 @@ The old Qwen implementation and its obsolete prompt-cache tests are archived und
 Verified September 21: release app and CLI build, 19 Swift tests, 5 Python unit tests; synthetic Italian audio correctly transcribed; staged app IPC health reached idle/modelReady=true with input hooks disabled and isolated data/socket. Exploratory 19 text cases preserve characters except punctuation insertions, including numbers, URLs and code tokens. These are smoke tests, not a holdout or proof of general quality. The model missed a question mark in “ciao come stai”; first load is roughly 5 seconds, hot inference around 20 ms in this small sample. Warmup starts on Fn press. Normal microphone and foreground-paste acceptance still requires a real user dictation.
 
 Acceptance: build app/CLI; run recovered and new tests; verify Parakeet with synthetic audio; verify non-pasting IPC; select offline cleanup using Italian synthetic fixtures preserving numbers, names, negations and content; stage signed app and retain rollback before installation. Local Bonsai evaluation is a separate follow-on, not evidence of Flow correctness.
+
+Update on 1 October 2026: current source and installed version are 2.4.0, using the pinned Parakeet Ultra model with FluidAudio 0.17.3. The original reconstruction caveats above remain historical context.

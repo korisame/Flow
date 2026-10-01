@@ -12,7 +12,7 @@ public final class FlowConfig {
 
     public static let defaults: [String: Any] = [
         "backend": "fluidaudio",
-        "model": "parakeet-tdt-0.6b-v3-coreml",
+        "model": Transcriber.selectedModelLabel,
         "cleanup_model": "flow-fullstop-base",
         "sound_feedback": true,
         "remove_fillers": true,
@@ -29,6 +29,7 @@ public final class FlowConfig {
 
     public init() {
         var loaded: [String: Any] = [:]
+        var shouldPersistMigration = false
         if let raw = try? Data(contentsOf: Self.configPath),
            let obj = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] {
             loaded = obj
@@ -40,10 +41,21 @@ public final class FlowConfig {
            ["codex", "auto", "openai", "haiku"].contains(ab) {
             merged["ai_backend"] = "local"
         }
+        if let backend = merged["backend"] as? String,
+           ["parakeet-mlx", "parakeet-coreml"].contains(backend) {
+            merged["backend"] = "fluidaudio"
+            shouldPersistMigration = true
+        }
+        if let model = merged["model"] as? String,
+           ["parakeet-tdt-0.6b-v3-coreml", "FluidInference/parakeet-tdt-0.6b-v3-coreml"].contains(model) {
+            merged["model"] = Transcriber.selectedModelLabel
+            shouldPersistMigration = true
+        }
         // Full-auto language: the manual language setting is gone, Flow always
         // detects the spoken language on its own. Drop any legacy key.
         merged.removeValue(forKey: "language")
         self.data = merged
+        if shouldPersistMigration { save() }
     }
 
     public func bool(_ key: String, default def: Bool = false) -> Bool {
